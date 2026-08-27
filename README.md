@@ -58,7 +58,7 @@ at its next prompt.
 
 ## Privacy
 
-One Swift file, no dependencies, no telemetry. It reads `claude agents --json`
+No dependencies, no telemetry. It reads `claude agents --json`
 and your local transcripts in `~/.claude/`. The only network calls are the
 ones you trigger: auto-name (a Haiku call through Claude Code) and, if you turn
 on usage limits, Anthropic's usage endpoint using your Claude Code login token.
