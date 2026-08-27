@@ -11,6 +11,8 @@ swiftc -swift-version 5 -O -o "$APP/Contents/MacOS/agent-hud" agent-hud.swift
 cp Info.plist "$APP/Contents/Info.plist"
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 codesign --force --sign - "$APP" 2>/dev/null || true
+# Refresh LaunchServices so Notification Centre and the Dock pick up the current icon.
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" >/dev/null 2>&1 || true
 
 pkill -x agent-hud 2>/dev/null || true
 sleep 1

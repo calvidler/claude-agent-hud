@@ -571,17 +571,12 @@ final class AgentModel: ObservableObject {
         for session in sessions {
             guard let tokens = contextTokens[session.sessionId] else { continue }
             let fraction = Double(tokens) / Double(windowTokens(for: session.sessionId))
-            if fraction >= warnFraction {
-                // Notify once per crossing; re-arms when the session drops back
-                // below the threshold (i.e. after a compact).
-                if !warned.contains(session.sessionId) {
-                    warned.insert(session.sessionId)
-                    if notifyContext {
-                        notifyHighContext(session: session, percent: Int(fraction * 100))
-                    }
-                }
-            } else {
-                warned.remove(session.sessionId)
+            // Once per session for the life of this HUD run: a compact and
+            // regrowth does not earn a second notification.
+            guard fraction >= warnFraction, !warned.contains(session.sessionId) else { continue }
+            warned.insert(session.sessionId)
+            if notifyContext {
+                notifyHighContext(session: session, percent: Int(fraction * 100))
             }
         }
     }
@@ -789,6 +784,7 @@ enum TerminalFocus {
     static func compactContext(pid: Int) {
         focus(pid: pid, thenType: "/compact")
     }
+
 
     /// Modal name prompt; nil when cancelled or left empty.
     static func askForName(current: String) -> String? {
@@ -1329,7 +1325,7 @@ struct HUDView: View {
                     TerminalFocus.clearContext(pid: session.pid)
                 }
             } else if needsCompact(session) {
-                rowAction("arrow.down.right.and.arrow.up.left", tint: .orange, help: "Compact this session's context (/compact)") {
+                rowAction("arrow.down.right.and.arrow.up.left", tint: primaryText, help: "Compact this session's context (/compact)") {
                     TerminalFocus.compactContext(pid: session.pid)
                 }
             }
@@ -1536,18 +1532,16 @@ struct HUDView: View {
         }
     }
 
+    /// Informational, not an alarm: past the threshold the figure steps up to
+    /// primary text weight, never to a warning colour.
     private func contextColor(_ percent: Int) -> Color {
-        if percent >= 85 { return .red }
-        if Double(percent) >= settings.prefs.contextWarnPct * 100 { return .orange }
-        return secondaryText
+        Double(percent) >= settings.prefs.contextWarnPct * 100 ? primaryText : secondaryText
     }
 
+    /// Informational: a limit Anthropic flags as warning or exceeded steps up
+    /// to primary text weight, never to a warning colour.
     private func usageColor(_ limit: UsageLimit) -> Color {
-        switch limit.severity {
-        case "warning": return .orange
-        case "normal": return secondaryText
-        default: return .red
-        }
+        limit.severity == "normal" ? secondaryText : primaryText
     }
 }
 
@@ -1696,7 +1690,7 @@ struct SettingsView: View {
     private var notificationsTab: some View {
         SettingsSection(
             header: "Notify when a session is",
-            footer: "High context uses the warn threshold from Details and needs Context % on. Each notification fires once per episode."
+            footer: "High context uses the warn threshold from Details and needs Context % on, and fires once per session. Waiting and finished fire once per episode."
         ) {
             SettingsRow("Waiting for input") { SettingsSwitch(isOn: $settings.prefs.notifyWaiting) }
             SettingsRow("Finished working") { SettingsSwitch(isOn: $settings.prefs.notifyFinished) }
@@ -2003,6 +1997,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addMenuItem("Show panel", action: #selector(showPanel))
         addMenuItem("Auto-name all", action: #selector(autoNameAll))
         addMenuItem("Settings…", action: #selector(openSettings), key: ",")
+        addMenuItem("Send test notification", action: #selector(testNotification))
         contextMenu.addItem(.separator())
         addMenuItem("Quit Claude Agent HUD", action: #selector(quit), key: "q")
     }
@@ -2072,6 +2067,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AutoNamer.renameAll(model.sessions)
     }
 
+
     @objc private func openSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
@@ -2085,6 +2081,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func testNotification() {
+        Notifier.post("Notifications are working")
     }
 
     @objc private func quit() {
