@@ -185,16 +185,28 @@ enum Shell {
     /// Runs a command to completion and returns its exit status and stdout.
     @discardableResult
     static func run(
-        _ path: String, _ arguments: [String], environment: [String: String]? = nil
+        _ path: String, _ arguments: [String],
+        environment: [String: String]? = nil, input: String? = nil,
+        currentDirectory: String? = nil, timeout: TimeInterval = 30
     ) -> (status: Int32, output: String) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = arguments
         if let environment { process.environment = environment }
+        if let currentDirectory { process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory) }
         let stdout = Pipe()
         process.standardOutput = stdout
         process.standardError = Pipe()
+        let stdin = Pipe()
+        process.standardInput = stdin
         guard (try? process.run()) != nil else { return (-1, "") }
+        // A hung child would otherwise block its caller forever (and, for the
+        // session poll, stop the HUD updating).
+        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
+        defer { watchdog.cancel() }
+        if let input { stdin.fileHandleForWriting.write(Data(input.utf8)) }
+        try? stdin.fileHandleForWriting.close()
         let data = stdout.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
@@ -239,22 +251,24 @@ final class AgentModel: ObservableObject {
     private var fetchingUsage = false
     private let claudePath = AgentModel.findClaude()
 
-    /// Locates the `claude` CLI: common install paths first, then the user's
-    /// login shell PATH (the app inherits a minimal PATH when launched from Finder).
-    private static func findClaude() -> String {
+    /// Locates the `claude` CLI by checking the usual install paths. Deliberately
+    /// no login-shell lookup: that would run the user's shell startup files with
+    /// this app as the responsible process and can trigger privacy prompts.
+    static func findClaude() -> String {
         let home = NSHomeDirectory()
-        let candidates = [
+        var candidates = [
             "/opt/homebrew/bin/claude",
             "/usr/local/bin/claude",
             "\(home)/.local/bin/claude",
             "\(home)/.claude/local/claude",
+            "\(home)/.npm-global/bin/claude",
         ]
-        if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
-            return found
+        let nvm = "\(home)/.nvm/versions/node"
+        if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvm) {
+            candidates += versions.sorted(by: >).map { "\(nvm)/\($0)/bin/claude" }
         }
-        let fromShell = Shell.run("/bin/zsh", ["-lc", "command -v claude"]).output
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return fromShell.isEmpty ? "/usr/local/bin/claude" : fromShell
+        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
+            ?? "/usr/local/bin/claude"
     }
 
     func start() {
@@ -288,6 +302,7 @@ final class AgentModel: ObservableObject {
     private func poll() {
         guard !polling else { return }
         polling = true
+        let wantPrompt = showPrompts  // read on main; the worker must not touch prefs mirrors
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let result = self.fetchSessions()
@@ -297,8 +312,8 @@ final class AgentModel: ObservableObject {
                 for session in sessions {
                     details[session.sessionId] = Self.readTranscriptDetail(
                         for: session,
-                        wantPrompt: self.showPrompts,
-                        wantAssistantInfo: self.showContext || self.showModel
+                        wantPrompt: wantPrompt,
+                        wantAssistantInfo: true  // context drives the compact action even when not shown
                     )
                 }
             }
@@ -317,7 +332,8 @@ final class AgentModel: ObservableObject {
         defaultWindowTokens = defaultWindow
         switch result {
         case .success(let sessions):
-            self.sessions = sessions
+            self.sessions = sessions.filter { $0.name != AutoNamer.helperSessionName }
+            SessionRegistry.reassert(self.sessions)
             lastPrompts = details.compactMapValues(\.prompt)
             contextTokens = details.compactMapValues(\.contextTokens)
             modelNames = details.compactMapValues(\.model)
@@ -326,7 +342,7 @@ final class AgentModel: ObservableObject {
             busySince = Self.transitionClocks(busySince, nowIn: sessions.ids(in: .busy))
             if notifyFinished {
                 for session in sessions where session.state == .idle && wasBusy.contains(session.sessionId) {
-                    notify("\(session.displayName) finished")
+                    Notifier.post("\(session.displayName) finished")
                 }
             }
             idleSince = Self.transitionClocks(idleSince, nowIn: sessions.ids(in: .idle))
@@ -346,8 +362,15 @@ final class AgentModel: ObservableObject {
         guard status == 0 else {
             return .failure(status == -1 ? .cantRun : .failed)
         }
-        guard let sessions = try? JSONDecoder().decode([AgentSession].self, from: Data(output.utf8)) else {
+        // Decode per entry so one odd session (e.g. a headless helper missing a
+        // field) is skipped rather than blanking the whole list.
+        guard let entries = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [Any] else {
             return .failure(.badOutput)
+        }
+        let decoder = JSONDecoder()
+        let sessions = entries.compactMap { entry -> AgentSession? in
+            guard let data = try? JSONSerialization.data(withJSONObject: entry) else { return nil }
+            return try? decoder.decode(AgentSession.self, from: data)
         }
         return .success(sessions)
     }
@@ -413,14 +436,20 @@ final class AgentModel: ObservableObject {
     }
 
     /// Agent/Task tool_use blocks in a transcript line, as (tool id, description).
+    /// Handled one block at a time so ids and descriptions pair correctly when
+    /// the same reply also calls other tools.
     private static func subagentSpawns(in line: Substring) -> [(id: String, description: String)] {
-        let ids = stringValues(of: "id", in: line, requiredPrefix: "toolu_")
-        let descriptions = stringValues(of: "description", in: line)
-        return zip(ids, descriptions).map { ($0, $1) }
+        line.components(separatedBy: "\"type\":\"tool_use\"").dropFirst().compactMap { block in
+            guard block.contains("\"name\":\"Agent\"") || block.contains("\"name\":\"Task\""),
+                  let id = stringValues(of: "id", in: Substring(block), requiredPrefix: "toolu_").first,
+                  let description = stringValues(of: "description", in: Substring(block)).first
+            else { return nil }
+            return (id, description)
+        }
     }
 
     /// Occurrences of "key":"value" in raw JSON text, without a full parse.
-    private static func stringValues(
+    static func stringValues(
         of key: String, in line: Substring, requiredPrefix: String? = nil
     ) -> [String] {
         var values: [String] = []
@@ -437,7 +466,7 @@ final class AgentModel: ObservableObject {
         return values
     }
 
-    private static func readTail(ofTranscriptFor session: AgentSession) -> String? {
+    static func readTail(ofTranscriptFor session: AgentSession, bytes: UInt64 = 262_144) -> String? {
         // Claude Code names transcript folders by replacing every
         // non-alphanumeric character of the cwd with a dash.
         let munged = String(session.cwd.map { $0.isLetter || $0.isNumber ? $0 : "-" })
@@ -445,7 +474,7 @@ final class AgentModel: ObservableObject {
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         guard let size = try? handle.seekToEnd() else { return nil }
-        try? handle.seek(toOffset: size - min(size, 262_144))
+        try? handle.seek(toOffset: size - min(size, bytes))
         guard let data = try? handle.readToEnd() else { return nil }
         return String(data: data, encoding: .utf8)
     }
@@ -460,7 +489,7 @@ final class AgentModel: ObservableObject {
 
     /// The human-typed text of a user entry, or nil for tool results and
     /// command/system wrapper messages.
-    private static func typedPrompt(from message: [String: Any]) -> String? {
+    static func typedPrompt(from message: [String: Any]) -> String? {
         var content: String?
         if let string = message["content"] as? String {
             content = string
@@ -515,7 +544,7 @@ final class AgentModel: ObservableObject {
     }
 
     private func notifyHighContext(session: AgentSession, percent: Int) {
-        notify("\(session.displayName) is at \(percent)% context, consider /compact")
+        Notifier.post("\(session.displayName) is at \(percent)% context, consider /compact")
     }
 
     /// Notifies once per stretch of waiting; re-arms when the session resumes.
@@ -524,18 +553,10 @@ final class AgentModel: ObservableObject {
         if notifyWaiting {
             for session in sessions where session.state == .waiting
                 && !notifiedWaiting.contains(session.sessionId) {
-                notify("\(session.displayName) needs input")
+                Notifier.post("\(session.displayName) needs input")
             }
         }
         notifiedWaiting = waiting
-    }
-
-    private func notify(_ body: String) {
-        let cleaned = body.replacingOccurrences(of: "\"", with: "")
-        let script = "display notification \"\(cleaned)\" with title \"Claude Agent HUD\""
-        DispatchQueue.global(qos: .utility).async {
-            Shell.run("/usr/bin/osascript", ["-e", script])
-        }
     }
 
     // MARK: Usage limits
@@ -617,15 +638,59 @@ private extension [AgentSession] {
 /// selection.
 enum TerminalFocus {
     static func focus(pid: Int) {
+        focus(pid: pid, thenType: nil)
+    }
+
+    /// Types a line into the session's terminal tab, as if entered at its prompt.
+    /// Terminal.app only; other terminals are just brought to the front.
+    static func clearContext(pid: Int) {
+        focus(pid: pid, thenType: "/clear")
+    }
+
+    static func compactContext(pid: Int) {
+        focus(pid: pid, thenType: "/compact")
+    }
+
+    /// Modal name prompt; nil when cancelled or left empty.
+    static func askForName(current: String) -> String? {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Rename session"
+        alert.informativeText = "Renames quietly, without touching the session's terminal."
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.stringValue = current
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty || name == current ? nil : name
+    }
+
+    private static func focus(pid: Int, thenType command: String?) {
         DispatchQueue.global(qos: .userInitiated).async {
             let tty = Shell.run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"]).output
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let app = ancestorApp(of: pid_t(pid))
-            if app?.bundleIdentifier == "com.apple.Terminal", !tty.isEmpty, tty != "??" {
-                selectTerminalTab(tty: "/dev/\(tty)")
+            guard let app = ancestorApp(of: pid_t(pid)), let bundleId = app.bundleIdentifier else { return }
+            if bundleId == "com.apple.Terminal", !tty.isEmpty, tty != "??" {
+                selectTerminalTab(tty: "/dev/\(tty)", thenType: command)
             }
             DispatchQueue.main.async {
-                app?.activate()
+                // Bring forward only the session's window (the one the script just
+                // made the app's main window), not every window of the app. macOS
+                // only lets the active app hand activation over, so the HUD briefly
+                // activates itself (allowed, the user just clicked it), yields, and
+                // requests single-window activation. If that is still refused, fall
+                // back to an Apple Event, which raises all of the app's windows.
+                NSApp.activate()
+                NSApp.yieldActivation(to: app)
+                let handedOver = app.activate()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    if !handedOver || !app.isActive {
+                        Shell.run("/usr/bin/osascript", ["-e", "tell application id \"\(bundleId)\" to activate"])
+                    }
+                }
             }
         }
     }
@@ -645,14 +710,19 @@ enum TerminalFocus {
         return nil
     }
 
-    private static func selectTerminalTab(tty: String) {
+    private static func selectTerminalTab(tty: String, thenType command: String?) {
+        // Type before raising the window: `set index` renumbers Terminal's windows,
+        // which would make the tab reference `t` resolve to a different window.
+        let typeLine = command.map { "                        do script \"\($0)\" in t" } ?? ""
         let script = """
         tell application "Terminal"
             repeat with w in windows
                 repeat with t in tabs of w
                     if tty of t is "\(tty)" then
                         set selected of t to true
+        \(typeLine)
                         set index of w to 1
+                        return
                     end if
                 end repeat
             end repeat
@@ -662,11 +732,253 @@ enum TerminalFocus {
     }
 }
 
+// MARK: - Notifications
+
+enum Notifier {
+    static func post(_ body: String) {
+        let cleaned = body.replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "\\", with: "")
+        let script = "display notification \"\(cleaned)\" with title \"Claude Agent HUD\""
+        DispatchQueue.global(qos: .utility).async {
+            Shell.run("/usr/bin/osascript", ["-e", script])
+        }
+    }
+}
+
+// MARK: - Session registry
+
+/// Renames a session without touching its terminal: writes the name into
+/// Claude Code's session registry (~/.claude/sessions/<pid>.json, which
+/// `claude agents` reads) and appends it to the transcript so the resume
+/// picker agrees. The live session's own prompt bar keeps its old name until
+/// it restarts. HUD-set names are re-applied if the session reverts to an
+/// auto-derived title; a name set with /rename is always respected.
+enum SessionRegistry {
+    private static var quietNames: [String: String] = [:]  // sessionId -> name, main thread only
+
+    static func setName(_ name: String, for session: AgentSession) {
+        DispatchQueue.main.async {
+            quietNames[session.sessionId] = name
+            write(name, pid: session.pid)
+            appendToTranscript(name, session: session)
+        }
+    }
+
+    static func reassert(_ sessions: [AgentSession]) {
+        for session in sessions {
+            guard let wanted = quietNames[session.sessionId], session.name != wanted else { continue }
+            if read(pid: session.pid)?["nameSource"] as? String == "custom" {
+                quietNames[session.sessionId] = nil  // renamed by the user; theirs wins
+            } else {
+                write(wanted, pid: session.pid)
+            }
+        }
+    }
+
+    private static func path(pid: Int) -> String {
+        NSHomeDirectory() + "/.claude/sessions/\(pid).json"
+    }
+
+    private static func read(pid: Int) -> [String: Any]? {
+        guard let data = FileManager.default.contents(atPath: path(pid: pid)) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    }
+
+    private static func write(_ name: String, pid: Int) {
+        guard var registry = read(pid: pid) else { return }
+        registry["name"] = name
+        registry["nameSource"] = "custom"
+        registry["nameSince"] = Int(Date().timeIntervalSince1970 * 1000)
+        guard let data = try? JSONSerialization.data(withJSONObject: registry) else { return }
+        try? data.write(to: URL(fileURLWithPath: path(pid: pid)), options: .atomic)
+    }
+
+    private static func appendToTranscript(_ name: String, session: AgentSession) {
+        let munged = String(session.cwd.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+        let path = NSHomeDirectory() + "/.claude/projects/\(munged)/\(session.sessionId).jsonl"
+        let entry: [String: String] = ["type": "agent-name", "agentName": name, "sessionId": session.sessionId]
+        guard let handle = FileHandle(forUpdatingAtPath: path),
+              let line = try? JSONSerialization.data(withJSONObject: entry) else { return }
+        defer { try? handle.close() }
+        // Never fuse with a final line that lacks its newline.
+        var payload = Data()
+        if let end = try? handle.seekToEnd(), end > 0 {
+            try? handle.seek(toOffset: end - 1)
+            if let last = try? handle.read(upToCount: 1), last != Data("\n".utf8) {
+                payload.append(contentsOf: "\n".utf8)
+            }
+            _ = try? handle.seekToEnd()
+        }
+        payload.append(line)
+        payload.append(contentsOf: "\n".utf8)
+        handle.write(payload)
+    }
+}
+
+// MARK: - Auto-naming
+
+/// Sessions currently being named, so the HUD can show progress.
+final class AutoNameStatus: ObservableObject {
+    static let shared = AutoNameStatus()
+    @Published var inFlight: Set<String> = []
+}
+
+/// Suggests a session name from its transcript using a headless Haiku call on
+/// the user's Claude Code login (cheap, no API key), then applies it quietly
+/// via SessionRegistry. The helper runs with no tools, no saved session, and
+/// in an empty folder, and is filtered out of the session list by its name.
+enum AutoNamer {
+    static let helperSessionName = "claude-agent-hud-namer"
+    private static let queue = DispatchQueue(label: "agent-hud.autonamer")
+
+    static func rename(_ session: AgentSession) {
+        DispatchQueue.main.async { AutoNameStatus.shared.inFlight.insert(session.sessionId) }
+        queue.async {
+            let result = suggestName(for: session)
+            DispatchQueue.main.async {
+                AutoNameStatus.shared.inFlight.remove(session.sessionId)
+                switch result {
+                case .success(let name):
+                    SessionRegistry.setName(name, for: session)
+                case .failure(let error):
+                    Notifier.post("Auto-name failed for \(session.displayName): \(error.reason)")
+                }
+            }
+        }
+    }
+
+    private struct NamingError: Error {
+        let reason: String
+    }
+
+    static func renameAll(_ sessions: [AgentSession]) {
+        for session in sessions {
+            rename(session)
+        }
+    }
+
+    private static func suggestName(for session: AgentSession) -> Result<String, NamingError> {
+        guard let excerpt = recentExcerpt(for: session) else {
+            return .success(fallbackName(for: session))
+        }
+        let instruction = """
+        You are naming a coding session so a developer can tell it apart from others at a glance. \
+        Below are whichever of these exist: the developer's recent requests (oldest first), the files \
+        edited most recently, subagent tasks, and if nothing was typed, the assistant's own summaries. \
+        Reply with only a 2-5 word kebab-case name that identifies the feature, component, or distinctive \
+        idea being worked on. Prefer concrete feature, component, or file names over generic verbs \
+        (never things like fix-bug, update-code, general-work). Weight the most recent requests most. \
+        No other text.
+        """
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        let (status, output) = Shell.run(
+            AgentModel.findClaude(),
+            ["-p", "--no-session-persistence", "--model", "haiku", "--tools", "",
+             "--output-format", "text", "-n", helperSessionName, instruction],
+            environment: environment, input: excerpt, currentDirectory: scratchDirectory(), timeout: 90
+        )
+        let raw = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "\n").first.map(String.init) ?? ""
+        guard status == 0 else {
+            return .failure(NamingError(reason: "claude exited \(status): \(raw.prefix(80))"))
+        }
+        let cleaned = raw.lowercased()
+            .map { $0.isLetter || $0.isNumber ? String($0) : "-" }
+            .joined()
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        guard cleaned.count >= 3, cleaned.count <= 48 else {
+            return .failure(NamingError(reason: "unusable suggestion \"\(raw.prefix(80))\""))
+        }
+        return .success(cleaned)
+    }
+
+    /// An empty folder for the helper to run in. Claude Code scans its working
+    /// directory at startup; running it in the home folder would touch
+    /// protected locations like ~/Pictures and trigger permission prompts.
+    private static func scratchDirectory() -> String {
+        let dir = NSHomeDirectory() + "/Library/Caches/app.claude-agent-hud/namer"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// What the session has been about, strongest signals first: the user's
+    /// last 20 typed prompts, the files edited most recently, subagent task
+    /// descriptions, and (only when nothing was typed, e.g. a session driven by
+    /// slash commands or resumed mid-task) a few of the assistant's own
+    /// summaries. Nil when the transcript holds none of these.
+    private static func recentExcerpt(for session: AgentSession) -> String? {
+        // Whole transcript, not a tail: tool output can push the last typed
+        // prompt megabytes back, and a tail then names the session off noise.
+        guard let text = AgentModel.readTail(ofTranscriptFor: session, bytes: 64 * 1_048_576) else { return nil }
+        var prompts: [String] = []
+        var files: [String] = []
+        var tasks: [String] = []
+        var summaries: [String] = []
+        let editTools = ["\"name\":\"Edit\"", "\"name\":\"Write\"", "\"name\":\"MultiEdit\"", "\"name\":\"NotebookEdit\""]
+        let ignoredExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "webp", "pdf", "icns"]
+        for line in text.split(separator: "\n").reversed() {
+            if prompts.count >= 20, files.count >= 12 { break }
+            if line.contains("\"tool_result\"") { continue }  // huge, and never a signal
+            if files.count < 12, line.contains("\"file_path\":\""), editTools.contains(where: line.contains) {
+                for path in AgentModel.stringValues(of: "file_path", in: line) {
+                    let name = (path as NSString).lastPathComponent
+                    let ext = (name as NSString).pathExtension.lowercased()
+                    if !files.contains(name), !ignoredExtensions.contains(ext) { files.append(name) }
+                }
+            }
+            if tasks.count < 6, line.contains("\"name\":\"Agent\"") || line.contains("\"name\":\"Task\"") {
+                tasks.append(contentsOf: AgentModel.stringValues(of: "description", in: line))
+            }
+            guard let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let message = entry["message"] as? [String: Any] else { continue }
+            switch entry["type"] as? String {
+            case "user" where prompts.count < 20 && entry["isMeta"] as? Bool != true:
+                if let prompt = AgentModel.typedPrompt(from: message) { prompts.append(prompt) }
+            case "assistant" where summaries.count < 4:
+                if let parts = message["content"] as? [[String: Any]],
+                   let textPart = parts.first(where: { $0["type"] as? String == "text" }),
+                   let textValue = textPart["text"] as? String {
+                    let trimmed = textValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.count > 40 { summaries.append(String(trimmed.prefix(240))) }
+                }
+            default:
+                break
+            }
+        }
+        var sections: [String] = []
+        if !prompts.isEmpty {
+            sections.append("Requests:\n" + prompts.reversed().map { "- \($0)" }.joined(separator: "\n"))
+        }
+        if !files.isEmpty {
+            sections.append("Files edited recently (most recent first): " + files.prefix(12).joined(separator: ", "))
+        }
+        if !tasks.isEmpty {
+            sections.append("Subagent tasks: " + tasks.prefix(6).joined(separator: "; "))
+        }
+        if prompts.isEmpty, !summaries.isEmpty {
+            sections.append("Assistant summaries (newest first):\n" + summaries.map { "- \($0)" }.joined(separator: "\n"))
+        }
+        return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
+    }
+
+    /// Last resort when the transcript says nothing: the project folder name.
+    static func fallbackName(for session: AgentSession) -> String {
+        let folder = (session.cwd as NSString).lastPathComponent.lowercased()
+            .map { $0.isLetter || $0.isNumber ? String($0) : "-" }
+            .joined()
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        return folder.isEmpty ? "untitled-session" : folder
+    }
+}
+
 // MARK: - HUD view
 
 struct HUDView: View {
     @ObservedObject var model: AgentModel
     @ObservedObject var settings: Settings
+    @ObservedObject private var naming = AutoNameStatus.shared
     let onClose: () -> Void
     let onSettings: () -> Void
     @State private var hoveredId: String?
@@ -791,16 +1103,21 @@ struct HUDView: View {
                     .foregroundStyle(contextColor(percent))
                     .allowsHitTesting(false)
             }
-            if isDead(session) {
-                Button {
-                    model.dismissed.insert(session.sessionId)
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(secondaryText)
+            // Row action: dead rows offer clear (/clear); idle rows past the
+            // context threshold offer compact (/compact). Everything else is
+            // in the right-click menu.
+            if naming.inFlight.contains(session.sessionId) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .allowsHitTesting(false)
+            } else if isDead(session) {
+                rowAction("eraser.fill", tint: secondaryText, help: "Clear this session's context (/clear)") {
+                    TerminalFocus.clearContext(pid: session.pid)
                 }
-                .buttonStyle(.plain)
-                .help("Clear this session from the list")
+            } else if needsCompact(session) {
+                rowAction("arrow.down.right.and.arrow.up.left", tint: .orange, help: "Compact this session's context (/compact)") {
+                    TerminalFocus.compactContext(pid: session.pid)
+                }
             }
             if !(model.subagents[session.sessionId] ?? []).isEmpty {
                 Button {
@@ -836,6 +1153,22 @@ struct HUDView: View {
         }
         .contextMenu {
             Button("Jump to terminal") { TerminalFocus.focus(pid: session.pid) }
+            Button("Rename…") {
+                if let name = TerminalFocus.askForName(current: session.displayName) {
+                    SessionRegistry.setName(name, for: session)
+                }
+            }
+            Button("Auto-name") { AutoNamer.rename(session) }
+            Button("Clear context (/clear)") { TerminalFocus.clearContext(pid: session.pid) }
+                .disabled(session.state == .busy)
+            Button("Compact context (/compact)") { TerminalFocus.compactContext(pid: session.pid) }
+                .disabled(session.state == .busy)
+            Button("Open new terminal here") {
+                // `open -a Terminal <folder>` opens a fresh Terminal window at that folder.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    Shell.run("/usr/bin/open", ["-a", "Terminal", session.cwd])
+                }
+            }
             Button("Reveal folder in Finder") {
                 NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: session.cwd)
             }
@@ -850,6 +1183,23 @@ struct HUDView: View {
             }
             Button("Hide from list") { model.dismissed.insert(session.sessionId) }
         }
+    }
+
+    private func rowAction(
+        _ symbol: String, tint: Color, help: String, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 10))
+                .foregroundStyle(tint)
+        }
+        .buttonStyle(.plain)
+        .help(help)
+    }
+
+    private func needsCompact(_ session: AgentSession) -> Bool {
+        guard session.state == .idle, let percent = contextPercent(session) else { return false }
+        return Double(percent) >= settings.prefs.contextWarnPct * 100
     }
 
     private func toggleExpanded(_ sessionId: String) {
@@ -928,6 +1278,7 @@ struct HUDView: View {
     }
 
     private func statusText(_ session: AgentSession) -> String {
+        if naming.inFlight.contains(session.sessionId) { return "naming…" }
         switch session.state {
         case .waiting:
             return session.waitingFor ?? "waiting"
@@ -1301,6 +1652,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let items: [(String, Selector)] = [
             ("Show panel", #selector(showPanel)),
             ("Hide panel", #selector(hidePanel)),
+            ("Auto-name all", #selector(autoNameAll)),
             ("Settings…", #selector(openSettings)),
         ]
         for (title, action) in items {
@@ -1397,6 +1749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         addMenuItem("Show panel", action: #selector(showPanel))
+        addMenuItem("Auto-name all", action: #selector(autoNameAll))
         addMenuItem("Settings…", action: #selector(openSettings), key: ",")
         contextMenu.addItem(.separator())
         addMenuItem("Quit Claude Agent HUD", action: #selector(quit), key: "q")
@@ -1463,6 +1816,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.orderOut(nil)
     }
 
+    @objc private func autoNameAll() {
+        AutoNamer.renameAll(model.sessions)
+    }
+
     @objc private func openSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
@@ -1484,6 +1841,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 // MARK: - Entry point
+
+// Writing to a child process that has already exited raises SIGPIPE, which
+// would kill the app; treat it as an ordinary write error instead.
+signal(SIGPIPE, SIG_IGN)
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
