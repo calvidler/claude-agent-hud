@@ -237,7 +237,25 @@ final class AgentModel: ObservableObject {
     private var notifiedWaiting: Set<String> = []
     private var polling = false
     private var fetchingUsage = false
-    private let claudePath = "/opt/homebrew/bin/claude"
+    private let claudePath = AgentModel.findClaude()
+
+    /// Locates the `claude` CLI: common install paths first, then the user's
+    /// login shell PATH (the app inherits a minimal PATH when launched from Finder).
+    private static func findClaude() -> String {
+        let home = NSHomeDirectory()
+        let candidates = [
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+            "\(home)/.local/bin/claude",
+            "\(home)/.claude/local/claude",
+        ]
+        if let found = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return found
+        }
+        let fromShell = Shell.run("/bin/zsh", ["-lc", "command -v claude"]).output
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return fromShell.isEmpty ? "/usr/local/bin/claude" : fromShell
+    }
 
     func start() {
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
