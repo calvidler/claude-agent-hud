@@ -105,9 +105,9 @@ No analytics, no telemetry, no network access beyond that one optional call.
 The whole app is `agent-hud.swift`. `build.sh` compiles it into the bundle
 using `Info.plist` and `AppIcon.icns` (regenerate the icon with
 `swift make-icon.swift out.png`, then `sips` and `iconutil`). Preferences are
-stored at `~/Library/Preferences/com.callum.agent-hud.plist`.
+stored at `~/Library/Preferences/app.claude-agent-hud.plist`.
 
 ## Uninstall
 
 Quit the app, delete `Claude Agent HUD.app` and the repo folder, and optionally
-remove `~/Library/Preferences/com.callum.agent-hud.plist`.
+remove `~/Library/Preferences/app.claude-agent-hud.plist`.

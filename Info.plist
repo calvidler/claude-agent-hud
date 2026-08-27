@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>agent-hud</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.callum.agent-hud</string>
+	<string>app.claude-agent-hud</string>
 	<key>CFBundleName</key>
 	<string>Claude Agent HUD</string>
 	<key>CFBundleShortVersionString</key>
