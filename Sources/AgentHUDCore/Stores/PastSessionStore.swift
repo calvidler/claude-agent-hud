@@ -73,7 +73,7 @@ final class PastSessionStore: ObservableObject {
             if cwd == nil, let value = entry["cwd"] as? String { cwd = value }
             if firstPrompt == nil, entry["type"] as? String == "user", entry["isMeta"] as? Bool != true,
                let message = entry["message"] as? [String: Any] {
-                firstPrompt = AgentModel.typedPrompt(from: message).map { String($0.prefix(80)) }
+                firstPrompt = TranscriptParser.typedPrompt(from: message).map { String($0.prefix(80)) }
             }
             if cwd != nil, firstPrompt != nil { break }
         }
@@ -85,7 +85,7 @@ final class PastSessionStore: ObservableObject {
         let kinds = ["agent-name": "agentName", "custom-title": "customTitle", "ai-title": "aiTitle"]
         for line in tail.split(separator: "\n").reversed() where names.count < kinds.count {
             for (kind, key) in kinds where names[kind] == nil && line.hasPrefix("{\"type\":\"\(kind)\"") {
-                if let value = AgentModel.stringValues(of: key, in: line).first, !value.isEmpty {
+                if let value = TranscriptParser.stringValues(of: key, in: line).first, !value.isEmpty {
                     names[kind] = value
                 }
             }

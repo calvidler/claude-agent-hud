@@ -93,7 +93,7 @@ enum TerminalFocus {
             Notifier.post("Can't resume \(displayName): its folder \(cwd) no longer exists")
             return
         }
-        var command = "cd \(shellQuoted(cwd)) && \(shellQuoted(AgentModel.findClaude())) --resume \(sessionId)"
+        var command = "cd \(shellQuoted(cwd)) && \(shellQuoted(ClaudeCLI.path)) --resume \(sessionId)"
         if fork { command += " --fork-session" }
         let script = "tell application \"Terminal\" to do script \"\(appleScriptQuoted(command))\""
         DispatchQueue.global(qos: .userInitiated).async {

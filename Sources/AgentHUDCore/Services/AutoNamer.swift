@@ -80,13 +80,11 @@ enum AutoNamer {
         (never things like fix-bug, update-code, general-work). Weight the most recent requests most. \
         No other text.
         """
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         let (status, output) = Shell.run(
-            AgentModel.findClaude(),
+            ClaudeCLI.path,
             ["-p", "--no-session-persistence", "--model", "haiku", "--tools", "",
              "--output-format", "text", "-n", helperSessionName, instruction],
-            environment: environment, input: excerpt, currentDirectory: scratchDirectory(), timeout: 90
+            environment: ClaudeCLI.environment, input: excerpt, currentDirectory: scratchDirectory(), timeout: 90
         )
         let raw = output.trimmingCharacters(in: .whitespacesAndNewlines)
             .split(separator: "\n").first.map(String.init) ?? ""
@@ -121,7 +119,7 @@ enum AutoNamer {
     private static func recentExcerpt(for transcript: TranscriptRef) -> String? {
         // Whole transcript, not a tail: tool output can push the last typed
         // prompt megabytes back, and a tail then names the session off noise.
-        guard let text = AgentModel.readTail(of: transcript, bytes: 64 * 1_048_576) else { return nil }
+        guard let text = TranscriptParser.readTail(of: transcript, bytes: 64 * 1_048_576) else { return nil }
         var prompts: [String] = []
         var files: [String] = []
         var tasks: [String] = []
@@ -132,21 +130,21 @@ enum AutoNamer {
             if prompts.count >= 20, files.count >= 12 { break }
             if line.contains("\"tool_result\"") { continue }  // huge, and never a signal
             if files.count < 12, line.contains("\"file_path\":\""), editTools.contains(where: line.contains) {
-                for path in AgentModel.stringValues(of: "file_path", in: line) {
+                for path in TranscriptParser.stringValues(of: "file_path", in: line) {
                     let name = (path as NSString).lastPathComponent
                     let ext = (name as NSString).pathExtension.lowercased()
                     if !files.contains(name), !ignoredExtensions.contains(ext) { files.append(name) }
                 }
             }
             if tasks.count < 6, line.contains("\"name\":\"Agent\"") || line.contains("\"name\":\"Task\"") {
-                tasks.append(contentsOf: AgentModel.stringValues(of: "description", in: line))
+                tasks.append(contentsOf: TranscriptParser.stringValues(of: "description", in: line))
             }
             guard let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                   let message = entry["message"] as? [String: Any] else { continue }
             switch entry["type"] as? String {
             case "user" where prompts.count < 20 && entry["isMeta"] as? Bool != true
                 && entry["isCompactSummary"] as? Bool != true:
-                if let prompt = AgentModel.typedPrompt(from: message) { prompts.append(prompt) }
+                if let prompt = TranscriptParser.typedPrompt(from: message) { prompts.append(prompt) }
             case "assistant" where summaries.count < 4:
                 if let parts = message["content"] as? [[String: Any]],
                    let textPart = parts.first(where: { $0["type"] as? String == "text" }),

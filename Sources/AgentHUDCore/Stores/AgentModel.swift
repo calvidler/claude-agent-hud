@@ -77,27 +77,7 @@ final class AgentModel: ObservableObject {
     private var ttyByPid: [Int: String] = [:]
     @Published private(set) var fetchingUsage = false
     private var usageTimer: Timer?
-    private let claudePath = AgentModel.findClaude()
 
-    /// Locates the `claude` CLI by checking the usual install paths. Deliberately
-    /// no login-shell lookup: that would run the user's shell startup files with
-    /// this app as the responsible process and can trigger privacy prompts.
-    static func findClaude() -> String {
-        let home = NSHomeDirectory()
-        var candidates = [
-            "/opt/homebrew/bin/claude",
-            "/usr/local/bin/claude",
-            "\(home)/.local/bin/claude",
-            "\(home)/.claude/local/claude",
-            "\(home)/.npm-global/bin/claude",
-        ]
-        let nvm = "\(home)/.nvm/versions/node"
-        if let versions = try? FileManager.default.contentsOfDirectory(atPath: nvm) {
-            candidates += versions.sorted(by: >).map { "\(nvm)/\($0)/bin/claude" }
-        }
-        return candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) })
-            ?? "/usr/local/bin/claude"
-    }
 
     func start() {
         Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -126,17 +106,6 @@ final class AgentModel: ObservableObject {
 
     // MARK: Session polling
 
-    private enum FetchError: Error {
-        case cantRun, failed, badOutput
-
-        var message: String {
-            switch self {
-            case .cantRun: return "can't run claude"
-            case .failed: return "claude agents failed"
-            case .badOutput: return "unexpected output"
-            }
-        }
-    }
 
     private func poll() {
         guard !polling else { return }
@@ -144,13 +113,13 @@ final class AgentModel: ObservableObject {
         let wantPrompt = showPrompts || driftRename  // read on main; the worker must not touch prefs mirrors
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
-            let result = self.fetchSessions()
+            let result = ClaudeCLI.fetchSessions()
             let defaultWindow = Self.readDefaultWindow()
             var details: [String: TranscriptDetail] = [:]
             if case .success(let sessions) = result {
                 for session in sessions {
-                    details[session.sessionId] = Self.readTranscriptDetail(
-                        for: session,
+                    details[session.sessionId] = TranscriptParser.detail(
+                        for: session.transcript,
                         wantPrompt: wantPrompt,
                         wantAssistantInfo: true  // context drives the compact action even when not shown
                     )
@@ -197,7 +166,7 @@ final class AgentModel: ObservableObject {
     }
 
     private func apply(
-        _ result: Result<[AgentSession], FetchError>,
+        _ result: Result<[AgentSession], ClaudeCLI.FetchError>,
         details: [String: TranscriptDetail],
         defaultWindow: Int
     ) {
@@ -234,25 +203,6 @@ final class AgentModel: ObservableObject {
         }
     }
 
-    private func fetchSessions() -> Result<[AgentSession], FetchError> {
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-        let (status, output) = Shell.run(claudePath, ["agents", "--json"], environment: environment)
-        guard status == 0 else {
-            return .failure(status == -1 ? .cantRun : .failed)
-        }
-        // Decode per entry so one odd session (e.g. a headless helper missing a
-        // field) is skipped rather than blanking the whole list.
-        guard let entries = try? JSONSerialization.jsonObject(with: Data(output.utf8)) as? [Any] else {
-            return .failure(.badOutput)
-        }
-        let decoder = JSONDecoder()
-        let sessions = entries.compactMap { entry -> AgentSession? in
-            guard let data = try? JSONSerialization.data(withJSONObject: entry) else { return nil }
-            return try? decoder.decode(AgentSession.self, from: data)
-        }
-        return .success(sessions)
-    }
 
     /// Keeps a start date per id: drops ids no longer present, stamps new ones now.
     private static func transitionClocks(
@@ -263,170 +213,6 @@ final class AgentModel: ObservableObject {
             clocks[id] = Date()
         }
         return clocks
-    }
-
-    // MARK: Transcript detail
-
-    private struct TranscriptDetail {
-        var prompt: String?
-        var contextTokens: Int?
-        var model: String?
-        var subagents: [Subagent] = []
-        var promptId: String?
-        var compactId: String?
-        var permissionMode: String?
-        var effort: String?
-        var activity: String?
-    }
-
-    /// Reads the tail of the session's local transcript for the latest typed
-    /// prompt and the latest reply's token usage and model. Local file read only.
-    private static func readTranscriptDetail(
-        for session: AgentSession, wantPrompt: Bool, wantAssistantInfo: Bool
-    ) -> TranscriptDetail {
-        var detail = TranscriptDetail()
-        guard let text = readTail(of: session.transcript) else { return detail }
-        var spawns: [(id: String, description: String)] = []
-        var finishedIds = Set<String>()
-        var latestTool: (id: String, activity: String)?
-        for line in text.split(separator: "\n").reversed() {
-            if latestTool == nil, line.contains("\"type\":\"assistant\""), line.contains("\"type\":\"tool_use\""),
-               let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-               let parts = (entry["message"] as? [String: Any])?["content"] as? [[String: Any]],
-               let block = parts.last(where: { $0["type"] as? String == "tool_use" }),
-               let id = block["id"] as? String, let name = block["name"] as? String {
-                latestTool = (id, Self.activityText(tool: name, input: block["input"] as? [String: Any] ?? [:]))
-            }
-            // Subagent spawns and completions are string-scanned rather than
-            // JSON-parsed; result lines can be huge and this runs every poll.
-            if line.contains("\"name\":\"Agent\"") || line.contains("\"name\":\"Task\"") {
-                spawns.append(contentsOf: Self.subagentSpawns(in: line))
-            } else if line.contains("\"tool_use_id\"") {
-                finishedIds.formUnion(Self.stringValues(of: "tool_use_id", in: line))
-            } else if detail.compactId == nil, line.contains("\"subtype\":\"compact_boundary\"") {
-                detail.compactId = Self.stringValues(of: "uuid", in: line).first
-            }
-            // Every prompt records the mode it was sent in, and switching mode
-            // writes its own record, so the newest mention is the current mode.
-            if detail.permissionMode == nil, line.contains("\"permissionMode\":\"") {
-                detail.permissionMode = Self.stringValues(of: "permissionMode", in: line).first
-            }
-            // Each reply records the effort level it ran at.
-            if detail.effort == nil, line.contains("\"type\":\"assistant\""), line.contains("\"effort\":\"") {
-                detail.effort = Self.stringValues(of: "effort", in: line).first
-            }
-
-            let promptDone = detail.prompt != nil || !wantPrompt
-            let assistantDone = detail.contextTokens != nil || !wantAssistantInfo
-            if promptDone && assistantDone { continue }
-            guard let entry = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let message = entry["message"] as? [String: Any] else { continue }
-            let type = entry["type"] as? String
-            if !assistantDone, type == "assistant",
-               let usage = message["usage"] as? [String: Any] {
-                detail.model = message["model"] as? String
-                detail.contextTokens = Self.contextTokens(from: usage)
-            }
-            if !promptDone, type == "user", entry["isMeta"] as? Bool != true,
-               entry["isCompactSummary"] as? Bool != true {
-                detail.prompt = Self.typedPrompt(from: message)
-                if detail.prompt != nil { detail.promptId = entry["uuid"] as? String }
-            }
-        }
-        // Results always follow their call, so a result seen for the newest
-        // call means the model has it back and is composing the next step.
-        if let latestTool {
-            detail.activity = finishedIds.contains(latestTool.id) ? "thinking" : latestTool.activity
-        }
-        // Scanned newest-first; show oldest-first, capped to the recent few.
-        detail.subagents = spawns.reversed().suffix(6).map {
-            Subagent(id: $0.id, description: $0.description, running: !finishedIds.contains($0.id))
-        }
-        return detail
-    }
-
-    /// Agent/Task tool_use blocks in a transcript line, as (tool id, description).
-    /// Handled one block at a time so ids and descriptions pair correctly when
-    /// the same reply also calls other tools.
-    private static func subagentSpawns(in line: Substring) -> [(id: String, description: String)] {
-        line.components(separatedBy: "\"type\":\"tool_use\"").dropFirst().compactMap { block in
-            guard block.contains("\"name\":\"Agent\"") || block.contains("\"name\":\"Task\""),
-                  let id = stringValues(of: "id", in: Substring(block), requiredPrefix: "toolu_").first,
-                  let description = stringValues(of: "description", in: Substring(block)).first
-            else { return nil }
-            return (id, description)
-        }
-    }
-
-    /// Occurrences of "key":"value" in raw JSON text, without a full parse.
-    static func stringValues(
-        of key: String, in line: Substring, requiredPrefix: String? = nil
-    ) -> [String] {
-        var values: [String] = []
-        let marker = "\"\(key)\":\""
-        var search = line[...]
-        while let start = search.range(of: marker) {
-            search = search[start.upperBound...]
-            guard let end = search.firstIndex(of: "\"") else { break }
-            let value = String(search[..<end])
-            if requiredPrefix == nil || value.hasPrefix(requiredPrefix!) {
-                values.append(value)
-            }
-        }
-        return values
-    }
-
-    static func readTail(of transcript: TranscriptRef, bytes: UInt64 = 262_144) -> String? {
-        guard let handle = FileHandle(forReadingAtPath: transcript.path) else { return nil }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd() else { return nil }
-        try? handle.seek(toOffset: size - min(size, bytes))
-        guard let data = try? handle.readToEnd() else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    /// One or two words for a tool call, e.g. "editing router.tsx". The line
-    /// also carries the timer, model and mode, so it has to stay short.
-    private static func activityText(tool: String, input: [String: Any]) -> String {
-        let file = (input["file_path"] as? String)
-            .map { String(($0 as NSString).lastPathComponent.prefix(24)) }
-        switch tool {
-        case "Read": return "reading \(file ?? "")"
-        case "Edit", "Write", "MultiEdit", "NotebookEdit": return "editing \(file ?? "")"
-        case "Bash": return "running"
-        case "Grep", "Glob": return "searching"
-        case "Agent", "Task": return "subagent"
-        case "WebFetch", "WebSearch": return "browsing"
-        case "Skill": return "/\(input["skill"] as? String ?? "skill")"
-        case "AskUserQuestion": return "asking"
-        default: return "working"
-        }
-    }
-
-    private static func contextTokens(from usage: [String: Any]) -> Int? {
-        let input = (usage["input_tokens"] as? Int ?? 0)
-            + (usage["cache_read_input_tokens"] as? Int ?? 0)
-            + (usage["cache_creation_input_tokens"] as? Int ?? 0)
-        guard input > 0 else { return nil }
-        return input + (usage["output_tokens"] as? Int ?? 0)
-    }
-
-    /// The human-typed text of a user entry, or nil for tool results and
-    /// command/system wrapper messages.
-    static func typedPrompt(from message: [String: Any]) -> String? {
-        var content: String?
-        if let string = message["content"] as? String {
-            content = string
-        } else if let parts = message["content"] as? [[String: Any]] {
-            guard !parts.contains(where: { $0["type"] as? String == "tool_result" }) else { return nil }
-            content = parts
-                .compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
-                .joined(separator: " ")
-        }
-        guard var prompt = content?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !prompt.isEmpty, !prompt.hasPrefix("<") else { return nil }
-        prompt = prompt.replacingOccurrences(of: "\n", with: " ")
-        return String(prompt.prefix(140))
     }
 
     // MARK: Context window
