@@ -130,6 +130,7 @@ struct Prefs: Codable, Equatable {
     var notifyHighContext = true
     var notifyWaiting = false
     var notifyFinished = false
+    var usageRefreshMinutes = 10.0
 }
 
 // Tolerant decoding: a saved blob missing newly added fields keeps its known
@@ -154,6 +155,7 @@ extension Prefs {
         notifyHighContext = (try? c.decode(Bool.self, forKey: .notifyHighContext)) ?? d.notifyHighContext
         notifyWaiting = (try? c.decode(Bool.self, forKey: .notifyWaiting)) ?? d.notifyWaiting
         notifyFinished = (try? c.decode(Bool.self, forKey: .notifyFinished)) ?? d.notifyFinished
+        usageRefreshMinutes = (try? c.decode(Double.self, forKey: .usageRefreshMinutes)) ?? d.usageRefreshMinutes
     }
 }
 
@@ -248,7 +250,8 @@ final class AgentModel: ObservableObject {
     private var warned: Set<String> = []
     private var notifiedWaiting: Set<String> = []
     private var polling = false
-    private var fetchingUsage = false
+    @Published private(set) var fetchingUsage = false
+    private var usageTimer: Timer?
     private let claudePath = AgentModel.findClaude()
 
     /// Locates the `claude` CLI by checking the usual install paths. Deliberately
@@ -278,11 +281,16 @@ final class AgentModel: ObservableObject {
         Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             self?.poll()
         }
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.refreshUsage()
-        }
         poll()
         refreshUsage()
+    }
+
+    /// (Re)starts the periodic usage refresh at the given interval.
+    func scheduleUsageRefresh(everyMinutes minutes: Double) {
+        usageTimer?.invalidate()
+        usageTimer = Timer.scheduledTimer(withTimeInterval: minutes * 60, repeats: true) { [weak self] _ in
+            self?.refreshUsage()
+        }
     }
 
     // MARK: Session polling
@@ -1063,6 +1071,14 @@ struct HUDView: View {
                     .font(.system(size: 9, weight: .medium).monospacedDigit())
                     .foregroundStyle(usageColor(limit))
             }
+            Spacer(minLength: 0)
+            if model.fetchingUsage {
+                ProgressView().controlSize(.mini)
+            } else {
+                rowAction("arrow.clockwise", tint: secondaryText, help: "Refresh usage now") {
+                    model.refreshUsage()
+                }
+            }
         }
         .padding(.horizontal, 6)
         .padding(.top, 1)
@@ -1433,6 +1449,11 @@ struct SettingsView: View {
                 footer: "Reads your Claude Code sign-in token from the Keychain to ask Anthropic for your limits. The token is sent only to api.anthropic.com."
             ) {
                 SettingsRow("Usage left") { SettingsSwitch(isOn: $settings.prefs.showUsage) }
+                SettingsRow("Refresh every \(Int(settings.prefs.usageRefreshMinutes))m") {
+                    Slider(value: $settings.prefs.usageRefreshMinutes, in: 1...60, step: 1)
+                        .frame(width: 160)
+                }
+                .disabled(!settings.prefs.showUsage)
             }
         }
     }
@@ -1621,6 +1642,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var panel: NSPanel!
     private var popover: NSPopover?
     private var lastMode: DisplayMode?
+    private var lastUsageInterval: Double?
     private var settingsWindow: NSWindow?
     private let model = AgentModel()
     private let settings = Settings()
@@ -1676,6 +1698,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let usageTurnedOn = !model.showUsage && prefs.showUsage
         model.showUsage = prefs.showUsage
         if usageTurnedOn { model.refreshUsage() }
+        if prefs.usageRefreshMinutes != lastUsageInterval {
+            lastUsageInterval = prefs.usageRefreshMinutes
+            model.scheduleUsageRefresh(everyMinutes: prefs.usageRefreshMinutes)
+        }
         applyDisplay(prefs)
     }
 
