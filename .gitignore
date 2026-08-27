@@ -1,3 +1,4 @@
 Claude Agent HUD.app/
 *.png
 AppIcon.iconset/
+.build/

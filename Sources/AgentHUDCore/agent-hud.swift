@@ -2862,12 +2862,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Entry point
 
-// Writing to a child process that has already exited raises SIGPIPE, which
-// would kill the app; treat it as an ordinary write error instead.
-signal(SIGPIPE, SIG_IGN)
+public enum AgentHUDApp {
+    /// Held here rather than in a local so the delegate outlives `run()`;
+    /// NSApplication holds its delegate weakly.
+    private static let delegate = AppDelegate()
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+    /// Starts the app. Does not return.
+    public static func run() {
+        // Writing to a child process that has already exited raises SIGPIPE, which
+        // would kill the app; treat it as an ordinary write error instead.
+        signal(SIGPIPE, SIG_IGN)
+
+        let app = NSApplication.shared
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        app.run()
+    }
+}
