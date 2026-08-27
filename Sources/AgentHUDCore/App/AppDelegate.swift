@@ -24,7 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         UNUserNotificationCenter.current().delegate = Notifier.shared
-        AutoNamer.onNamed = { [weak model] sessionId in model?.resetPromptCount(for: sessionId) }
+        AutoNamer.onNamed = { [weak model] sessionId in model?.naming.resetPromptCount(for: sessionId) }
         applyPrefs(settings.prefs)
         settingsObservation = settings.$prefs.sink { [weak self] prefs in
             self?.applyPrefs(prefs)
@@ -86,14 +86,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func applyPrefs(_ prefs: Prefs) {
         model.showPrompts = prefs.showLastPrompt
-        model.showContext = prefs.showContext
-        model.showModel = prefs.showModel
-        model.warnFraction = prefs.contextWarnPct
-        model.notifyContext = prefs.notifyHighContext
-        model.notifyWaiting = prefs.notifyWaiting
-        model.notifyFinished = prefs.notifyFinished
-        model.driftRename = prefs.driftRename
-        model.driftRenameAfter = Int(prefs.driftRenameAfter)
+        model.alerts.showContext = prefs.showContext
+        model.alerts.warnFraction = prefs.contextWarnPct
+        model.alerts.notifyContext = prefs.notifyHighContext
+        model.alerts.notifyWaiting = prefs.notifyWaiting
+        model.alerts.notifyFinished = prefs.notifyFinished
+        model.naming.enabled = prefs.driftRename
+        model.naming.renameAfter = Int(prefs.driftRenameAfter)
         let usageTurnedOn = !usage.enabled && prefs.showUsage
         usage.enabled = prefs.showUsage
         if usageTurnedOn { usage.refresh() }

@@ -91,12 +91,7 @@ enum AutoNamer {
         guard status == 0 else {
             return .failure(NamingError(reason: "claude exited \(status): \(raw.prefix(80))"))
         }
-        let cleaned = raw.lowercased()
-            .map { $0.isLetter || $0.isNumber ? String($0) : "-" }
-            .joined()
-            .split(separator: "-", omittingEmptySubsequences: true)
-            .joined(separator: "-")
-        guard cleaned.count >= 3, cleaned.count <= 48 else {
+        guard let cleaned = normalizeName(raw) else {
             return .failure(NamingError(reason: "unusable suggestion \"\(raw.prefix(80))\""))
         }
         return .success(cleaned)
@@ -172,13 +167,25 @@ enum AutoNamer {
         return sections.isEmpty ? nil : sections.joined(separator: "\n\n")
     }
 
-    /// Last resort when the transcript says nothing: the project folder name.
-    static func fallbackName(cwd: String) -> String {
-        let folder = (cwd as NSString).lastPathComponent.lowercased()
+    /// Lower-cased, with every run of anything else collapsed to one dash.
+    static func kebabCased(_ text: String) -> String {
+        text.lowercased()
             .map { $0.isLetter || $0.isNumber ? String($0) : "-" }
             .joined()
             .split(separator: "-", omittingEmptySubsequences: true)
             .joined(separator: "-")
+    }
+
+    /// A model's suggestion turned into a name, or nil if it is unusable: too
+    /// short to mean anything, or long enough that the model ignored the brief.
+    static func normalizeName(_ raw: String) -> String? {
+        let cleaned = kebabCased(raw)
+        return (3...48).contains(cleaned.count) ? cleaned : nil
+    }
+
+    /// Last resort when the transcript says nothing: the project folder name.
+    static func fallbackName(cwd: String) -> String {
+        let folder = kebabCased((cwd as NSString).lastPathComponent)
         return folder.isEmpty ? "untitled-session" : folder
     }
 }

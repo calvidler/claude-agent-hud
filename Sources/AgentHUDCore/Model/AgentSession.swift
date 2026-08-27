@@ -72,3 +72,9 @@ struct UsageLimit: Identifiable, Equatable, Codable {
     let severity: String
     var id: String { label }
 }
+
+extension [AgentSession] {
+    func ids(in state: SessionStatus) -> Set<String> {
+        Set(filter { $0.state == state }.map(\.sessionId))
+    }
+}
