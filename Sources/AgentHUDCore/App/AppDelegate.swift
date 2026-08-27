@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pastSessionsWindow: NSWindow?
     private let pastSessions = PastSessionStore()
     private let model = AgentModel()
+    private let usage = UsageService()
     private let settings = Settings()
     private var settingsObservation: AnyCancellable?
     private var hotKey: HotKey?
@@ -35,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return panel.isVisible || popover?.isShown == true
         }
         model.start()
+        usage.refresh()
         applyDisplay(settings.prefs)
         hotKey = HotKey(keyCode: kVK_ANSI_A, modifiers: cmdKey | optionKey) { [weak self] in
             self?.togglePanel()
@@ -92,12 +94,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.notifyFinished = prefs.notifyFinished
         model.driftRename = prefs.driftRename
         model.driftRenameAfter = Int(prefs.driftRenameAfter)
-        let usageTurnedOn = !model.showUsage && prefs.showUsage
-        model.showUsage = prefs.showUsage
-        if usageTurnedOn { model.refreshUsage() }
+        let usageTurnedOn = !usage.enabled && prefs.showUsage
+        usage.enabled = prefs.showUsage
+        if usageTurnedOn { usage.refresh() }
         if prefs.usageRefreshMinutes != lastUsageInterval {
             lastUsageInterval = prefs.usageRefreshMinutes
-            model.scheduleUsageRefresh(everyMinutes: prefs.usageRefreshMinutes)
+            usage.schedule(everyMinutes: prefs.usageRefreshMinutes)
         }
         applyDisplay(prefs)
     }
@@ -128,6 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rootView: HUDView(
                 model: model,
                 settings: settings,
+                usage: usage,
                 onClose: onClose,
                 onSettings: { [weak self] in self?.openSettings() },
                 onPastSessions: { [weak self] in self?.openPastSessions() }

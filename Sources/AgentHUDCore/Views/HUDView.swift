@@ -6,6 +6,7 @@ import SwiftUI
 struct HUDView: View {
     @ObservedObject var model: AgentModel
     @ObservedObject var settings: Settings
+    @ObservedObject var usage: UsageService
     @ObservedObject private var naming = AutoNameStatus.shared
     let onClose: () -> Void
     let onSettings: () -> Void
@@ -102,26 +103,26 @@ struct HUDView: View {
     private var usageFooter: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 10) {
-                if model.usage.isEmpty {
-                    Text(model.fetchingUsage ? "fetching usage…" : "usage")
+                if usage.limits.isEmpty {
+                    Text(usage.fetching ? "fetching usage…" : "usage")
                         .font(.system(size: 9))
                         .foregroundStyle(secondaryText)
                 }
-                ForEach(model.usage) { limit in
+                ForEach(usage.limits) { limit in
                     Text("\(limit.label) \(limit.percent)%")
                         .font(.system(size: 9, weight: .medium).monospacedDigit())
                         .foregroundStyle(usageColor(limit))
                 }
                 Spacer(minLength: 0)
-                if model.fetchingUsage {
+                if usage.fetching {
                     ProgressView().controlSize(.mini)
                 } else {
                     rowAction("arrow.clockwise", tint: secondaryText, help: usageAgeText.map { "Refresh usage now (\($0))" } ?? "Refresh usage now") {
-                        model.refreshUsage(force: true)
+                        usage.refresh(force: true)
                     }
                 }
             }
-            if let error = model.usageError, !model.fetchingUsage {
+            if let error = usage.error, !usage.fetching {
                 Text(usageErrorText(error))
                     .font(.system(size: 9))
                     .foregroundStyle(secondaryText)
@@ -134,13 +135,13 @@ struct HUDView: View {
 
     /// One quiet line, e.g. "refresh failed: rate limited (429), retry in 14m".
     private func usageErrorText(_ error: String) -> String {
-        guard let retryAt = model.usageRetryAt, retryAt > model.now else { return "refresh failed: \(error)" }
+        guard let retryAt = usage.retryAt, retryAt > model.now else { return "refresh failed: \(error)" }
         return "refresh failed: \(error), retry in \(max(1, Int(retryAt.timeIntervalSince(model.now) / 60)))m"
     }
 
     /// "updated 12m ago", for the numbers currently on screen.
     private var usageAgeText: String? {
-        guard let fetchedAt = model.usageFetchedAt else { return nil }
+        guard let fetchedAt = usage.fetchedAt else { return nil }
         let minutes = Int(model.now.timeIntervalSince(fetchedAt) / 60)
         if minutes < 1 { return "updated just now" }
         if minutes < 60 { return "updated \(minutes)m ago" }

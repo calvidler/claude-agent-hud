@@ -33,19 +33,9 @@ final class AgentModel: ObservableObject {
     @Published var subagents: [String: [Subagent]] = [:]
     @Published var defaultWindowTokens = 200_000
 
-    // Last good usage result, cached across launches so the footer never
-    // starts blank; a failed refresh keeps these and reports the error below.
-    @Published var usage: [UsageLimit] = UsageCache.load()?.limits ?? []
-    @Published var usageFetchedAt: Date? = UsageCache.load()?.fetchedAt
-    @Published var usageError: String?
-    /// Earliest time the next automatic usage fetch may run, after a 429.
-    @Published var usageRetryAt: Date?
-    private var usageBackoff: TimeInterval = 0
-
     // Mirrors of the prefs this model acts on, kept current by AppDelegate.
     var showPrompts = false
     var showContext = true
-    var showUsage = false
     var showModel = false
     var warnFraction = 0.6
     var notifyContext = true
@@ -72,11 +62,7 @@ final class AgentModel: ObservableObject {
     private var sessionIdByPid: [Int: String] = [:]
     private var lastCompactIds: [String: String] = [:]
     private var polling = false
-    // Serialises the tty checks; they share this cache (a pid's tty never changes).
-    private let focusQueue = DispatchQueue(label: "app.claude-agent-hud.focus", qos: .utility)
-    private var ttyByPid: [Int: String] = [:]
-    @Published private(set) var fetchingUsage = false
-    private var usageTimer: Timer?
+    private let focusTracker = TerminalFocusTracker()
 
 
     func start() {
@@ -92,16 +78,6 @@ final class AgentModel: ObservableObject {
             self?.refreshFocus()
         }
         poll()
-        refreshUsage()
-    }
-
-    /// (Re)starts the periodic usage refresh, or stops it for manual-only.
-    func scheduleUsageRefresh(everyMinutes minutes: Double) {
-        usageTimer?.invalidate()
-        guard minutes > 0 else { return }
-        usageTimer = Timer.scheduledTimer(withTimeInterval: minutes * 60, repeats: true) { [weak self] _ in
-            self?.refreshUsage()
-        }
     }
 
     // MARK: Session polling
@@ -132,9 +108,9 @@ final class AgentModel: ObservableObject {
         }
     }
 
-    /// Updates `focusedPid`: one AppleScript call, only while Terminal is in
-    /// front and the HUD is showing. Clicking the HUD's own windows keeps the
-    /// mark; any other app drops it.
+    /// Updates `focusedPid`, only while Terminal is in front and the HUD is
+    /// showing. Clicking the HUD's own windows keeps the mark; any other app
+    /// drops it.
     private func refreshFocus() {
         let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         guard front != Bundle.main.bundleIdentifier else { return }
@@ -142,27 +118,9 @@ final class AgentModel: ObservableObject {
             focusedPid = nil
             return
         }
-        let sessions = self.sessions
-        focusQueue.async { [weak self] in
-            guard let self else { return }
-            let focused = self.terminalSelectedPid(sessions)
-            DispatchQueue.main.async { self.focusedPid = focused }
+        focusTracker.selectedPid(among: sessions) { [weak self] pid in
+            self?.focusedPid = pid
         }
-    }
-
-    /// The session running in Terminal.app's selected tab, matched by tty.
-    private func terminalSelectedPid(_ sessions: [AgentSession]) -> Int? {
-        let tty = Shell.run("/usr/bin/osascript", ["-e", "tell application \"Terminal\" to tty of selected tab of front window"]).output
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard tty.hasPrefix("/dev/") else { return nil }
-        for session in sessions where ttyByPid[session.pid] == nil {
-            let raw = Shell.run("/bin/ps", ["-o", "tty=", "-p", "\(session.pid)"]).output
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            ttyByPid[session.pid] = raw.isEmpty || raw == "??" ? "" : "/dev/\(raw)"
-        }
-        let livePids = Set(sessions.map(\.pid))
-        ttyByPid = ttyByPid.filter { livePids.contains($0.key) }
-        return sessions.first { ttyByPid[$0.pid] == tty }?.pid
     }
 
     private func apply(
@@ -363,119 +321,6 @@ final class AgentModel: ObservableObject {
             }
         }
         notifiedWaiting = waiting
-    }
-
-    // MARK: Usage limits
-
-    /// Reads the Claude Code OAuth token from the Keychain and asks Anthropic's
-    /// usage endpoint for the account's rate-limit status. Only runs while the
-    /// toggle is on; the token is sent nowhere except api.anthropic.com.
-    /// Automatic fetches respect the 429 backoff; a manual refresh (`force`)
-    /// tries regardless, since the user chose to.
-    func refreshUsage(force: Bool = false) {
-        guard showUsage, !fetchingUsage else { return }
-        if !force, let retryAt = usageRetryAt, retryAt > Date() { return }
-        fetchingUsage = true
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = Self.fetchUsageLimits()
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.fetchingUsage = false
-                switch result {
-                case .success(let limits):
-                    self.usage = limits
-                    self.usageFetchedAt = Date()
-                    self.usageError = nil
-                    UsageCache.save(limits: limits, fetchedAt: Date())
-                    self.usageRetryAt = nil
-                    self.usageBackoff = 0
-                case .failure(let error):
-                    self.usageError = error.reason
-                    if error.rateLimited {
-                        // The endpoint is known to keep returning 429 for a long
-                        // time once tripped; back off 15m, 30m, 60m, capped at 2h,
-                        // and never sooner than the server's retry-after.
-                        self.usageBackoff = min(max(self.usageBackoff * 2, 15 * 60), 2 * 3600)
-                        self.usageRetryAt = Date().addingTimeInterval(max(self.usageBackoff, error.retryAfter ?? 0))
-                    }
-                }
-            }
-        }
-    }
-
-    private struct UsageError: Error {
-        let reason: String
-        var rateLimited = false
-        var retryAfter: TimeInterval?
-    }
-
-    private static func fetchUsageLimits() -> Result<[UsageLimit], UsageError> {
-        let keychain = Shell.run(
-            "/usr/bin/security",
-            ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        )
-        guard keychain.status == 0 else {
-            // 36 = access denied by the user, 44 = item not found, 128 = user cancelled.
-            return .failure(UsageError(reason: "keychain refused (\(keychain.status))"))
-        }
-        guard let parsed = try? JSONSerialization.jsonObject(with: Data(keychain.output.utf8)) as? [String: Any],
-              let oauth = parsed["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else {
-            return .failure(UsageError(reason: "no sign-in token"))
-        }
-
-        var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
-        request.timeoutInterval = 10
-
-        var result: Result<[UsageLimit], UsageError> = .failure(UsageError(reason: "no response"))
-        let done = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            defer { done.signal() }
-            if let error {
-                result = .failure(UsageError(reason: (error as? URLError)?.code == .notConnectedToInternet ? "offline" : "network error"))
-                return
-            }
-            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-                if http.statusCode == 429 {
-                    let retryAfter = (http.value(forHTTPHeaderField: "retry-after")).flatMap(Double.init)
-                    result = .failure(UsageError(reason: "rate limited (429)", rateLimited: true, retryAfter: retryAfter))
-                } else {
-                    result = .failure(UsageError(reason: "http \(http.statusCode)"))
-                }
-                return
-            }
-            guard let data,
-                  let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let limits = body["limits"] as? [[String: Any]] else {
-                result = .failure(UsageError(reason: "unexpected response"))
-                return
-            }
-            result = .success(limits.compactMap(Self.usageLimit(from:)))
-        }.resume()
-        done.wait()
-        return result
-    }
-
-    private static func usageLimit(from limit: [String: Any]) -> UsageLimit? {
-        guard let percent = limit["percent"] as? Int else { return nil }
-        let kind = limit["kind"] as? String ?? ""
-        let label: String
-        switch kind {
-        case "session":
-            label = "5h"
-        case "weekly_all":
-            label = "week"
-        default:
-            let scopeModel = (limit["scope"] as? [String: Any])?["model"] as? [String: Any]
-            label = (scopeModel?["display_name"] as? String)?.lowercased() ?? kind
-        }
-        return UsageLimit(
-            label: label,
-            percent: percent,
-            severity: limit["severity"] as? String ?? "normal"
-        )
     }
 }
 
