@@ -11,6 +11,7 @@ import AppKit
 import Carbon.HIToolbox
 import Combine
 import SwiftUI
+import UserNotifications
 
 // MARK: - Session data
 
@@ -51,7 +52,7 @@ struct Subagent: Identifiable, Equatable {
     let running: Bool
 }
 
-struct UsageLimit: Identifiable, Equatable {
+struct UsageLimit: Identifiable, Equatable, Codable {
     let label: String
     let percent: Int
     let severity: String
@@ -130,7 +131,16 @@ struct Prefs: Codable, Equatable {
     var notifyHighContext = true
     var notifyWaiting = false
     var notifyFinished = false
-    var usageRefreshMinutes = 10.0
+    var usageRefreshMinutes = Prefs.manualUsageRefresh
+    var driftRename = false
+    var driftRenameAfter = 10.0
+
+    /// Usage refresh interval meaning "no timer, refresh by hand only".
+    static let manualUsageRefresh = 0.0
+    static let usageRefreshChoices: [(label: String, minutes: Double)] = [
+        ("5 minutes", 5), ("10 minutes", 10), ("15 minutes", 15), ("30 minutes", 30),
+        ("1 hour", 60), ("2 hours", 120), ("Manual only", manualUsageRefresh),
+    ]
 }
 
 // Tolerant decoding: a saved blob missing newly added fields keeps its known
@@ -155,7 +165,16 @@ extension Prefs {
         notifyHighContext = (try? c.decode(Bool.self, forKey: .notifyHighContext)) ?? d.notifyHighContext
         notifyWaiting = (try? c.decode(Bool.self, forKey: .notifyWaiting)) ?? d.notifyWaiting
         notifyFinished = (try? c.decode(Bool.self, forKey: .notifyFinished)) ?? d.notifyFinished
-        usageRefreshMinutes = (try? c.decode(Double.self, forKey: .usageRefreshMinutes)) ?? d.usageRefreshMinutes
+        // Snap older free-form minute values (and the old 61 = manual sentinel) to a choice.
+        let savedRefresh = (try? c.decode(Double.self, forKey: .usageRefreshMinutes)) ?? d.usageRefreshMinutes
+        if savedRefresh <= 0 || savedRefresh >= 61 {
+            usageRefreshMinutes = Prefs.manualUsageRefresh
+        } else {
+            let timed = Prefs.usageRefreshChoices.map(\.minutes).filter { $0 > 0 }
+            usageRefreshMinutes = timed.min { abs($0 - savedRefresh) < abs($1 - savedRefresh) } ?? d.usageRefreshMinutes
+        }
+        driftRename = (try? c.decode(Bool.self, forKey: .driftRename)) ?? d.driftRename
+        driftRenameAfter = (try? c.decode(Double.self, forKey: .driftRenameAfter)) ?? d.driftRenameAfter
     }
 }
 
@@ -235,7 +254,14 @@ final class AgentModel: ObservableObject {
     @Published var subagents: [String: [Subagent]] = [:]
     @Published var defaultWindowTokens = 200_000
 
-    @Published var usage: [UsageLimit] = []
+    // Last good usage result, cached across launches so the footer never
+    // starts blank; a failed refresh keeps these and reports the error below.
+    @Published var usage: [UsageLimit] = UsageCache.load()?.limits ?? []
+    @Published var usageFetchedAt: Date? = UsageCache.load()?.fetchedAt
+    @Published var usageError: String?
+    /// Earliest time the next automatic usage fetch may run, after a 429.
+    @Published var usageRetryAt: Date?
+    private var usageBackoff: TimeInterval = 0
 
     // Mirrors of the prefs this model acts on, kept current by AppDelegate.
     var showPrompts = false
@@ -246,9 +272,14 @@ final class AgentModel: ObservableObject {
     var notifyContext = true
     var notifyWaiting = false
     var notifyFinished = false
+    var driftRename = false
+    var driftRenameAfter = 10
 
     private var warned: Set<String> = []
     private var notifiedWaiting: Set<String> = []
+    // Drift renaming: typed prompts seen per session since its last naming.
+    private var promptCounts: [String: Int] = [:]
+    private var lastPromptIds: [String: String] = [:]
     private var polling = false
     @Published private(set) var fetchingUsage = false
     private var usageTimer: Timer?
@@ -285,9 +316,10 @@ final class AgentModel: ObservableObject {
         refreshUsage()
     }
 
-    /// (Re)starts the periodic usage refresh at the given interval.
+    /// (Re)starts the periodic usage refresh, or stops it for manual-only.
     func scheduleUsageRefresh(everyMinutes minutes: Double) {
         usageTimer?.invalidate()
+        guard minutes > 0 else { return }
         usageTimer = Timer.scheduledTimer(withTimeInterval: minutes * 60, repeats: true) { [weak self] _ in
             self?.refreshUsage()
         }
@@ -310,7 +342,7 @@ final class AgentModel: ObservableObject {
     private func poll() {
         guard !polling else { return }
         polling = true
-        let wantPrompt = showPrompts  // read on main; the worker must not touch prefs mirrors
+        let wantPrompt = showPrompts || driftRename  // read on main; the worker must not touch prefs mirrors
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             let result = self.fetchSessions()
@@ -357,6 +389,7 @@ final class AgentModel: ObservableObject {
             dismissed.subtract(Set(sessions.filter { $0.state != .idle }.map(\.sessionId)))
             checkContextWarnings(sessions)
             checkWaitingNotifications(sessions)
+            trackPrompts(sessions, details: details)
             errorMessage = nil
         case .failure(let error):
             errorMessage = error.message
@@ -401,6 +434,7 @@ final class AgentModel: ObservableObject {
         var contextTokens: Int?
         var model: String?
         var subagents: [Subagent] = []
+        var promptId: String?
     }
 
     /// Reads the tail of the session's local transcript for the latest typed
@@ -434,6 +468,7 @@ final class AgentModel: ObservableObject {
             }
             if !promptDone, type == "user", entry["isMeta"] as? Bool != true {
                 detail.prompt = Self.typedPrompt(from: message)
+                if detail.prompt != nil { detail.promptId = entry["uuid"] as? String }
             }
         }
         // Scanned newest-first; show oldest-first, capped to the recent few.
@@ -551,6 +586,34 @@ final class AgentModel: ObservableObject {
         }
     }
 
+    // MARK: Drift renaming
+
+    /// Counts newly typed prompts per session (the latest user entry's uuid
+    /// changing between polls) and auto-names once the threshold is passed.
+    private func trackPrompts(_ sessions: [AgentSession], details: [String: TranscriptDetail]) {
+        let live = Set(sessions.map(\.sessionId))
+        promptCounts = promptCounts.filter { live.contains($0.key) }
+        lastPromptIds = lastPromptIds.filter { live.contains($0.key) }
+        for session in sessions {
+            let id = session.sessionId
+            guard let promptId = details[id]?.promptId else { continue }
+            if let previous = lastPromptIds[id], previous != promptId {
+                promptCounts[id, default: 0] += 1
+            }
+            lastPromptIds[id] = promptId
+            guard driftRename, promptCounts[id, default: 0] >= driftRenameAfter,
+                  !AutoNameStatus.shared.inFlight.contains(id) else { continue }
+            promptCounts[id] = 0
+            if !SessionRegistry.isUserNamed(session) {
+                AutoNamer.rename(session)
+            }
+        }
+    }
+
+    func resetPromptCount(for sessionId: String) {
+        promptCounts[sessionId] = 0
+    }
+
     private func notifyHighContext(session: AgentSession, percent: Int) {
         Notifier.post("\(session.displayName) is at \(percent)% context, consider /compact")
     }
@@ -572,40 +635,89 @@ final class AgentModel: ObservableObject {
     /// Reads the Claude Code OAuth token from the Keychain and asks Anthropic's
     /// usage endpoint for the account's rate-limit status. Only runs while the
     /// toggle is on; the token is sent nowhere except api.anthropic.com.
-    func refreshUsage() {
+    /// Automatic fetches respect the 429 backoff; a manual refresh (`force`)
+    /// tries regardless, since the user chose to.
+    func refreshUsage(force: Bool = false) {
         guard showUsage, !fetchingUsage else { return }
+        if !force, let retryAt = usageRetryAt, retryAt > Date() { return }
         fetchingUsage = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let limits = Self.fetchUsageLimits()
+            let result = Self.fetchUsageLimits()
             DispatchQueue.main.async {
-                self?.fetchingUsage = false
-                if let limits { self?.usage = limits }
+                guard let self else { return }
+                self.fetchingUsage = false
+                switch result {
+                case .success(let limits):
+                    self.usage = limits
+                    self.usageFetchedAt = Date()
+                    self.usageError = nil
+                    UsageCache.save(limits: limits, fetchedAt: Date())
+                    self.usageRetryAt = nil
+                    self.usageBackoff = 0
+                case .failure(let error):
+                    self.usageError = error.reason
+                    if error.rateLimited {
+                        // The endpoint is known to keep returning 429 for a long
+                        // time once tripped; back off 15m, 30m, 60m, capped at 2h,
+                        // and never sooner than the server's retry-after.
+                        self.usageBackoff = min(max(self.usageBackoff * 2, 15 * 60), 2 * 3600)
+                        self.usageRetryAt = Date().addingTimeInterval(max(self.usageBackoff, error.retryAfter ?? 0))
+                    }
+                }
             }
         }
     }
 
-    private static func fetchUsageLimits() -> [UsageLimit]? {
-        let raw = Shell.run(
+    private struct UsageError: Error {
+        let reason: String
+        var rateLimited = false
+        var retryAfter: TimeInterval?
+    }
+
+    private static func fetchUsageLimits() -> Result<[UsageLimit], UsageError> {
+        let keychain = Shell.run(
             "/usr/bin/security",
             ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        ).output
-        guard let parsed = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+        )
+        guard keychain.status == 0 else {
+            // 36 = access denied by the user, 44 = item not found, 128 = user cancelled.
+            return .failure(UsageError(reason: "keychain refused (\(keychain.status))"))
+        }
+        guard let parsed = try? JSONSerialization.jsonObject(with: Data(keychain.output.utf8)) as? [String: Any],
               let oauth = parsed["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String else { return nil }
+              let token = oauth["accessToken"] as? String else {
+            return .failure(UsageError(reason: "no sign-in token"))
+        }
 
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
         request.timeoutInterval = 10
 
-        var result: [UsageLimit]?
+        var result: Result<[UsageLimit], UsageError> = .failure(UsageError(reason: "no response"))
         let done = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: request) { data, _, _ in
+        URLSession.shared.dataTask(with: request) { data, response, error in
             defer { done.signal() }
+            if let error {
+                result = .failure(UsageError(reason: (error as? URLError)?.code == .notConnectedToInternet ? "offline" : "network error"))
+                return
+            }
+            if let http = response as? HTTPURLResponse, http.statusCode != 200 {
+                if http.statusCode == 429 {
+                    let retryAfter = (http.value(forHTTPHeaderField: "retry-after")).flatMap(Double.init)
+                    result = .failure(UsageError(reason: "rate limited (429)", rateLimited: true, retryAfter: retryAfter))
+                } else {
+                    result = .failure(UsageError(reason: "http \(http.statusCode)"))
+                }
+                return
+            }
             guard let data,
                   let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let limits = body["limits"] as? [[String: Any]] else { return }
-            result = limits.compactMap(Self.usageLimit(from:))
+                  let limits = body["limits"] as? [[String: Any]] else {
+                result = .failure(UsageError(reason: "unexpected response"))
+                return
+            }
+            result = .success(limits.compactMap(Self.usageLimit(from:)))
         }.resume()
         done.wait()
         return result
@@ -629,6 +741,25 @@ final class AgentModel: ObservableObject {
             percent: percent,
             severity: limit["severity"] as? String ?? "normal"
         )
+    }
+}
+
+enum UsageCache {
+    private struct Entry: Codable {
+        let limits: [UsageLimit]
+        let fetchedAt: Date
+    }
+
+    static func load() -> (limits: [UsageLimit], fetchedAt: Date)? {
+        guard let data = UserDefaults.standard.data(forKey: "usageCache"),
+              let entry = try? JSONDecoder().decode(Entry.self, from: data) else { return nil }
+        return (entry.limits, entry.fetchedAt)
+    }
+
+    static func save(limits: [UsageLimit], fetchedAt: Date) {
+        if let data = try? JSONEncoder().encode(Entry(limits: limits, fetchedAt: fetchedAt)) {
+            UserDefaults.standard.set(data, forKey: "usageCache")
+        }
     }
 }
 
@@ -742,8 +873,36 @@ enum TerminalFocus {
 
 // MARK: - Notifications
 
-enum Notifier {
+/// Posts notifications as the app itself, so they carry its name and icon.
+/// macOS asks for notification permission the first time; if it is denied
+/// the AppleScript route is used instead (attributed to Script Editor).
+final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = Notifier()
+
     static func post(_ body: String) {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else { fallback(body); return }
+            let content = UNMutableNotificationContent()
+            content.title = "Claude Agent HUD"
+            content.body = body
+            let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+            center.add(request) { error in
+                if error != nil { fallback(body) }
+            }
+        }
+    }
+
+    /// Show banners even while the HUD is the active app (e.g. Settings open).
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    private static func fallback(_ body: String) {
         let cleaned = body.replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "\\", with: "")
         let script = "display notification \"\(cleaned)\" with title \"Claude Agent HUD\""
         DispatchQueue.global(qos: .utility).async {
@@ -769,6 +928,13 @@ enum SessionRegistry {
             write(name, pid: session.pid)
             appendToTranscript(name, session: session)
         }
+    }
+
+    /// True when the user named this session themselves (via /rename), as
+    /// opposed to Claude Code's derived title or a name the HUD set.
+    static func isUserNamed(_ session: AgentSession) -> Bool {
+        guard read(pid: session.pid)?["nameSource"] as? String == "custom" else { return false }
+        return quietNames[session.sessionId] != session.name
     }
 
     static func reassert(_ sessions: [AgentSession]) {
@@ -838,6 +1004,9 @@ enum AutoNamer {
     static let helperSessionName = "claude-agent-hud-namer"
     private static let queue = DispatchQueue(label: "agent-hud.autonamer")
 
+    /// Called on the main thread after a session is auto-named, with its id.
+    static var onNamed: ((String) -> Void)?
+
     static func rename(_ session: AgentSession) {
         DispatchQueue.main.async { AutoNameStatus.shared.inFlight.insert(session.sessionId) }
         queue.async {
@@ -847,6 +1016,7 @@ enum AutoNamer {
                 switch result {
                 case .success(let name):
                     SessionRegistry.setName(name, for: session)
+                    onNamed?(session.sessionId)
                 case .failure(let error):
                     Notifier.post("Auto-name failed for \(session.displayName): \(error.reason)")
                 }
@@ -1024,7 +1194,7 @@ struct HUDView: View {
                     }
                 }
             }
-            if settings.prefs.showUsage, !model.usage.isEmpty {
+            if settings.prefs.showUsage {
                 divider
                 usageFooter
             }
@@ -1065,23 +1235,51 @@ struct HUDView: View {
     }
 
     private var usageFooter: some View {
-        HStack(spacing: 10) {
-            ForEach(model.usage) { limit in
-                Text("\(limit.label) \(limit.percent)%")
-                    .font(.system(size: 9, weight: .medium).monospacedDigit())
-                    .foregroundStyle(usageColor(limit))
-            }
-            Spacer(minLength: 0)
-            if model.fetchingUsage {
-                ProgressView().controlSize(.mini)
-            } else {
-                rowAction("arrow.clockwise", tint: secondaryText, help: "Refresh usage now") {
-                    model.refreshUsage()
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 10) {
+                if model.usage.isEmpty {
+                    Text(model.fetchingUsage ? "fetching usage…" : "usage")
+                        .font(.system(size: 9))
+                        .foregroundStyle(secondaryText)
                 }
+                ForEach(model.usage) { limit in
+                    Text("\(limit.label) \(limit.percent)%")
+                        .font(.system(size: 9, weight: .medium).monospacedDigit())
+                        .foregroundStyle(usageColor(limit))
+                }
+                Spacer(minLength: 0)
+                if model.fetchingUsage {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    rowAction("arrow.clockwise", tint: secondaryText, help: usageAgeText.map { "Refresh usage now (\($0))" } ?? "Refresh usage now") {
+                        model.refreshUsage(force: true)
+                    }
+                }
+            }
+            if let error = model.usageError, !model.fetchingUsage {
+                Text(usageErrorText(error))
+                    .font(.system(size: 9))
+                    .foregroundStyle(secondaryText)
+                    .lineLimit(1)
             }
         }
         .padding(.horizontal, 6)
         .padding(.top, 1)
+    }
+
+    /// One quiet line, e.g. "refresh failed: rate limited (429), retry in 14m".
+    private func usageErrorText(_ error: String) -> String {
+        guard let retryAt = model.usageRetryAt, retryAt > model.now else { return "refresh failed: \(error)" }
+        return "refresh failed: \(error), retry in \(max(1, Int(retryAt.timeIntervalSince(model.now) / 60)))m"
+    }
+
+    /// "updated 12m ago", for the numbers currently on screen.
+    private var usageAgeText: String? {
+        guard let fetchedAt = model.usageFetchedAt else { return nil }
+        let minutes = Int(model.now.timeIntervalSince(fetchedAt) / 60)
+        if minutes < 1 { return "updated just now" }
+        if minutes < 60 { return "updated \(minutes)m ago" }
+        return "updated \(minutes / 60)h ago"
     }
 
     // MARK: Rows
@@ -1419,7 +1617,7 @@ struct SettingsView: View {
                     .frame(width: 200)
                 }
                 SettingsRow("Dead after \(deadAfterLabel)") {
-                    Slider(value: $settings.prefs.deadAfterHours, in: 0.5...6, step: 0.5)
+                    Slider(value: stepped($settings.prefs.deadAfterHours, by: 0.5), in: 0.5...6)
                         .frame(width: 160)
                 }
             }
@@ -1438,22 +1636,38 @@ struct SettingsView: View {
                 SettingsRow("Last prompt") { SettingsSwitch(isOn: $settings.prefs.showLastPrompt) }
                 SettingsRow("Model") { SettingsSwitch(isOn: $settings.prefs.showModel) }
                 SettingsRow("Context %") { SettingsSwitch(isOn: $settings.prefs.showContext) }
-                SettingsRow("Warn above \(Int(settings.prefs.contextWarnPct * 100))%") {
-                    Slider(value: $settings.prefs.contextWarnPct, in: 0.3...0.9, step: 0.05)
+                SettingsRow("Warn above \(Int((settings.prefs.contextWarnPct * 100).rounded()))%") {
+                    Slider(value: stepped($settings.prefs.contextWarnPct, by: 0.05), in: 0.3...0.9)
                         .frame(width: 160)
                 }
                 .disabled(!settings.prefs.showContext)
             }
             SettingsSection(
                 header: "Account",
-                footer: "Reads your Claude Code sign-in token from the Keychain to ask Anthropic for your limits. The token is sent only to api.anthropic.com."
+                footer: "Reads your Claude Code sign-in token from the Keychain to ask Anthropic for your limits. The token is sent only to api.anthropic.com. Anthropic rate-limits this endpoint hard (429); the HUD keeps the last numbers and backs off, so a slow refresh or manual only is the safe choice."
             ) {
                 SettingsRow("Usage left") { SettingsSwitch(isOn: $settings.prefs.showUsage) }
-                SettingsRow("Refresh every \(Int(settings.prefs.usageRefreshMinutes))m") {
-                    Slider(value: $settings.prefs.usageRefreshMinutes, in: 1...60, step: 1)
-                        .frame(width: 160)
+                SettingsRow("Refresh") {
+                    Picker("", selection: $settings.prefs.usageRefreshMinutes) {
+                        ForEach(Prefs.usageRefreshChoices, id: \.minutes) { choice in
+                            Text(choice.label).tag(choice.minutes)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 160)
                 }
                 .disabled(!settings.prefs.showUsage)
+            }
+            SettingsSection(
+                header: "Auto-name",
+                footer: "Renames a session automatically once this many new prompts have been typed since it was last named. Names you set with /rename are never replaced."
+            ) {
+                SettingsRow("Rename as work drifts") { SettingsSwitch(isOn: $settings.prefs.driftRename) }
+                SettingsRow("After \(Int(settings.prefs.driftRenameAfter)) prompts") {
+                    Slider(value: stepped($settings.prefs.driftRenameAfter, by: 1), in: 3...30)
+                        .frame(width: 160)
+                }
+                .disabled(!settings.prefs.driftRename)
             }
         }
     }
@@ -1496,6 +1710,14 @@ struct SettingsView: View {
         let hours = settings.prefs.deadAfterHours
         if hours < 1 { return "\(Int(hours * 60))m" }
         return hours == hours.rounded() ? "\(Int(hours))h" : String(format: "%.1fh", hours)
+    }
+
+    /// A slider binding that snaps to a step without drawing tick marks.
+    private func stepped(_ binding: Binding<Double>, by step: Double) -> Binding<Double> {
+        Binding(
+            get: { binding.wrappedValue },
+            set: { binding.wrappedValue = ($0 / step).rounded() * step }
+        )
     }
 
     private var backgroundColor: Binding<Color> {
@@ -1651,6 +1873,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let contextMenu = NSMenu()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        UNUserNotificationCenter.current().delegate = Notifier.shared
+        AutoNamer.onNamed = { [weak model] sessionId in model?.resetPromptCount(for: sessionId) }
         applyPrefs(settings.prefs)
         settingsObservation = settings.$prefs.sink { [weak self] prefs in
             self?.applyPrefs(prefs)
@@ -1695,6 +1919,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.notifyContext = prefs.notifyHighContext
         model.notifyWaiting = prefs.notifyWaiting
         model.notifyFinished = prefs.notifyFinished
+        model.driftRename = prefs.driftRename
+        model.driftRenameAfter = Int(prefs.driftRenameAfter)
         let usageTurnedOn = !model.showUsage && prefs.showUsage
         model.showUsage = prefs.showUsage
         if usageTurnedOn { model.refreshUsage() }
