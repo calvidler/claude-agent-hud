@@ -115,12 +115,17 @@ extension Prefs {
         notifyHighContext = (try? c.decode(Bool.self, forKey: .notifyHighContext)) ?? d.notifyHighContext
         notifyWaiting = (try? c.decode(Bool.self, forKey: .notifyWaiting)) ?? d.notifyWaiting
         notifyFinished = (try? c.decode(Bool.self, forKey: .notifyFinished)) ?? d.notifyFinished
-        // Snap older free-form minute values (and the old 61 = manual sentinel) to a choice.
+        // One of the current choices is kept as-is; older free-form minute values
+        // snap to the nearest. 0 and, in older builds, 61 both meant manual, as
+        // does anything longer than the longest interval now offered.
         let savedRefresh = (try? c.decode(Double.self, forKey: .usageRefreshMinutes)) ?? d.usageRefreshMinutes
-        if savedRefresh <= 0 || savedRefresh >= 61 {
+        let choices = Prefs.usageRefreshChoices.map(\.minutes)
+        let timed = choices.filter { $0 > 0 }
+        if choices.contains(savedRefresh) {
+            usageRefreshMinutes = savedRefresh
+        } else if savedRefresh <= 0 || savedRefresh == 61 || savedRefresh > (timed.max() ?? 0) {
             usageRefreshMinutes = Prefs.manualUsageRefresh
         } else {
-            let timed = Prefs.usageRefreshChoices.map(\.minutes).filter { $0 > 0 }
             usageRefreshMinutes = timed.min { abs($0 - savedRefresh) < abs($1 - savedRefresh) } ?? d.usageRefreshMinutes
         }
         driftRename = (try? c.decode(Bool.self, forKey: .driftRename)) ?? d.driftRename

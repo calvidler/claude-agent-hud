@@ -57,7 +57,7 @@ final class PastSessionStore: ObservableObject {
 
     /// The head of a transcript holds the cwd and the first typed prompt; the
     /// tail holds the latest name records. Only those two slices are read.
-    private static func read(_ path: String, id: String, modified: Date) -> PastSession? {
+    static func read(_ path: String, id: String, modified: Date) -> PastSession? {
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         guard let size = try? handle.seekToEnd(), size > 0 else { return nil }

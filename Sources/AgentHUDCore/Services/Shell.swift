@@ -17,7 +17,9 @@ enum Shell {
         if let currentDirectory { process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory) }
         let stdout = Pipe()
         process.standardOutput = stdout
-        process.standardError = Pipe()
+        // Discarded, not piped: nothing reads stderr, and an undrained pipe
+        // blocks the child as soon as it writes past the buffer (~64 KB).
+        process.standardError = FileHandle.nullDevice
         let stdin = Pipe()
         process.standardInput = stdin
         guard (try? process.run()) != nil else { return (-1, "") }
