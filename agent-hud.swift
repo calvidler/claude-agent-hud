@@ -785,6 +785,33 @@ enum TerminalFocus {
         focus(pid: pid, thenType: "/compact")
     }
 
+    /// Types /clear into every session's Terminal.app tab in one pass, without
+    /// selecting or raising anything. Sessions in other terminals are skipped.
+    static func clearContext(pids: [Int]) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let ttys = pids.compactMap { pid -> String? in
+                let tty = Shell.run("/bin/ps", ["-o", "tty=", "-p", "\(pid)"]).output
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !tty.isEmpty, tty != "??",
+                      ancestorApp(of: pid_t(pid))?.bundleIdentifier == "com.apple.Terminal" else { return nil }
+                return "/dev/\(tty)"
+            }
+            guard !ttys.isEmpty else { return }
+            let list = ttys.map { "\"\($0)\"" }.joined(separator: ", ")
+            let script = """
+            tell application "Terminal"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        if {\(list)} contains (tty of t) then
+                            do script "/clear" in t
+                        end if
+                    end repeat
+                end repeat
+            end tell
+            """
+            Shell.run("/usr/bin/osascript", ["-e", script])
+        }
+    }
 
     /// Modal name prompt; nil when cancelled or left empty.
     static func askForName(current: String) -> String? {
@@ -1893,6 +1920,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ("Show panel", #selector(showPanel)),
             ("Hide panel", #selector(hidePanel)),
             ("Auto-name all", #selector(autoNameAll)),
+            ("Clear all", #selector(clearAll)),
             ("Settings…", #selector(openSettings)),
         ]
         for (title, action) in items {
@@ -1996,6 +2024,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         addMenuItem("Show panel", action: #selector(showPanel))
         addMenuItem("Auto-name all", action: #selector(autoNameAll))
+        addMenuItem("Clear all", action: #selector(clearAll))
         addMenuItem("Settings…", action: #selector(openSettings), key: ",")
         addMenuItem("Send test notification", action: #selector(testNotification))
         contextMenu.addItem(.separator())
@@ -2067,6 +2096,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AutoNamer.renameAll(model.sessions)
     }
 
+    /// Clears every listed session that is sitting at its prompt. Working
+    /// sessions are left alone: a /clear typed mid-task would only run once the
+    /// task finished, wiping the context it had just built.
+    @objc private func clearAll() {
+        let sessions = model.sessions.filter {
+            $0.state != .busy && !model.dismissed.contains($0.sessionId)
+        }
+        guard !sessions.isEmpty else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = sessions.count == 1
+            ? "Clear context in 1 session?"
+            : "Clear context in \(sessions.count) sessions?"
+        alert.informativeText = "Types /clear into each waiting or idle session's terminal. Working sessions are skipped."
+        alert.addButton(withTitle: "Clear")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        TerminalFocus.clearContext(pids: sessions.map(\.pid))
+    }
 
     @objc private func openSettings() {
         if settingsWindow == nil {
