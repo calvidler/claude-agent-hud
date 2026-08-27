@@ -1,4 +1,4 @@
-// Agent HUD: a small always-on-top panel showing the state of local Claude Code
+// Claude Agent HUD: a small always-on-top panel showing the state of local Claude Code
 // sessions. Data sources, all local unless noted:
 //   - `claude agents --json` for the session list and status (polled every 4s)
 //   - each session's transcript tail (~/.claude/projects/...) for the last typed
@@ -8,6 +8,7 @@
 // Build and relaunch with ./build.sh.
 
 import AppKit
+import Carbon.HIToolbox
 import Combine
 import SwiftUI
 
@@ -120,15 +121,15 @@ struct Prefs: Codable, Equatable {
     var textOpacity = 0.9
     var deadAfterHours = 6.0
     var showLastPrompt = false
-    var showContext = true
+    var showContext = false
     var contextWarnPct = 0.6
     var showUsage = false
-    var hudName = "agent hud"
     var displayMode = DisplayMode.overlay
     var showInDock = false
     var showModel = false
     var notifyHighContext = true
     var notifyWaiting = false
+    var notifyFinished = false
 }
 
 // Tolerant decoding: a saved blob missing newly added fields keeps its known
@@ -147,13 +148,12 @@ extension Prefs {
         showContext = (try? c.decode(Bool.self, forKey: .showContext)) ?? d.showContext
         contextWarnPct = (try? c.decode(Double.self, forKey: .contextWarnPct)) ?? d.contextWarnPct
         showUsage = (try? c.decode(Bool.self, forKey: .showUsage)) ?? d.showUsage
-        let savedName = (try? c.decode(String.self, forKey: .hudName)) ?? d.hudName
-        hudName = savedName == "agents" ? d.hudName : savedName  // pre-rename default
         displayMode = (try? c.decode(DisplayMode.self, forKey: .displayMode)) ?? d.displayMode
         showInDock = (try? c.decode(Bool.self, forKey: .showInDock)) ?? d.showInDock
         showModel = (try? c.decode(Bool.self, forKey: .showModel)) ?? d.showModel
         notifyHighContext = (try? c.decode(Bool.self, forKey: .notifyHighContext)) ?? d.notifyHighContext
         notifyWaiting = (try? c.decode(Bool.self, forKey: .notifyWaiting)) ?? d.notifyWaiting
+        notifyFinished = (try? c.decode(Bool.self, forKey: .notifyFinished)) ?? d.notifyFinished
     }
 }
 
@@ -231,6 +231,7 @@ final class AgentModel: ObservableObject {
     var warnFraction = 0.6
     var notifyContext = true
     var notifyWaiting = false
+    var notifyFinished = false
 
     private var warned: Set<String> = []
     private var notifiedWaiting: Set<String> = []
@@ -303,7 +304,13 @@ final class AgentModel: ObservableObject {
             contextTokens = details.compactMapValues(\.contextTokens)
             modelNames = details.compactMapValues(\.model)
             subagents = details.mapValues(\.subagents)
+            let wasBusy = Set(busySince.keys)
             busySince = Self.transitionClocks(busySince, nowIn: sessions.ids(in: .busy))
+            if notifyFinished {
+                for session in sessions where session.state == .idle && wasBusy.contains(session.sessionId) {
+                    notify("\(session.displayName) finished")
+                }
+            }
             idleSince = Self.transitionClocks(idleSince, nowIn: sessions.ids(in: .idle))
             dismissed.subtract(Set(sessions.filter { $0.state != .idle }.map(\.sessionId)))
             checkContextWarnings(sessions)
@@ -507,7 +514,7 @@ final class AgentModel: ObservableObject {
 
     private func notify(_ body: String) {
         let cleaned = body.replacingOccurrences(of: "\"", with: "")
-        let script = "display notification \"\(cleaned)\" with title \"Agent HUD\""
+        let script = "display notification \"\(cleaned)\" with title \"Claude Agent HUD\""
         DispatchQueue.global(qos: .utility).async {
             Shell.run("/usr/bin/osascript", ["-e", script])
         }
@@ -698,7 +705,7 @@ struct HUDView: View {
             }
             .buttonStyle(.plain)
             Spacer()
-            Text(settings.prefs.hudName)
+            Text("Claude Agent HUD")
                 .font(.system(size: 9, weight: .medium))
                 .foregroundStyle(secondaryText)
             Spacer()
@@ -779,11 +786,7 @@ struct HUDView: View {
             }
             if !(model.subagents[session.sessionId] ?? []).isEmpty {
                 Button {
-                    if expandedIds.contains(session.sessionId) {
-                        expandedIds.remove(session.sessionId)
-                    } else {
-                        expandedIds.insert(session.sessionId)
-                    }
+                    toggleExpanded(session.sessionId)
                 } label: {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8, weight: .semibold))
@@ -813,6 +816,35 @@ struct HUDView: View {
         .onTapGesture {
             TerminalFocus.focus(pid: session.pid)
         }
+        .contextMenu {
+            Button("Jump to terminal") { TerminalFocus.focus(pid: session.pid) }
+            Button("Reveal folder in Finder") {
+                NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: session.cwd)
+            }
+            Divider()
+            Button("Copy folder path") { copy(session.cwd) }
+            Button("Copy session ID") { copy(session.sessionId) }
+            Divider()
+            if !(model.subagents[session.sessionId] ?? []).isEmpty {
+                Button(expandedIds.contains(session.sessionId) ? "Hide subagents" : "Show subagents") {
+                    toggleExpanded(session.sessionId)
+                }
+            }
+            Button("Hide from list") { model.dismissed.insert(session.sessionId) }
+        }
+    }
+
+    private func toggleExpanded(_ sessionId: String) {
+        if expandedIds.contains(sessionId) {
+            expandedIds.remove(sessionId)
+        } else {
+            expandedIds.insert(sessionId)
+        }
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     private func subagentRows(_ session: AgentSession) -> some View {
@@ -940,73 +972,135 @@ struct HUDView: View {
 
 struct SettingsView: View {
     @ObservedObject var settings: Settings
+    @State private var tab = Tab.general
     @State private var resetToken = 0
 
+    private enum Tab: String, CaseIterable, Identifiable {
+        case general = "General"
+        case details = "Details"
+        case appearance = "Appearance"
+        case notifications = "Notifications"
+        var id: String { rawValue }
+    }
+
     var body: some View {
-        Form {
-            Picker("Display", selection: $settings.prefs.displayMode) {
-                ForEach(DisplayMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
+        VStack(spacing: 18) {
+            Picker("", selection: $tab) {
+                ForEach(Tab.allCases) { tab in
+                    Text(tab.rawValue).tag(tab)
                 }
             }
-            Toggle("Show in Dock", isOn: $settings.prefs.showInDock)
-            Picker("Row order", selection: $settings.prefs.order) {
-                ForEach(RowOrder.allCases) { order in
-                    Text(order.label).tag(order)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            switch tab {
+            case .general: generalTab
+            case .details: detailsTab
+            case .appearance: appearanceTab
+            case .notifications: notificationsTab
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
+        .id(resetToken)
+    }
+
+    // MARK: Tabs
+
+    private var generalTab: some View {
+        VStack(spacing: 16) {
+            SettingsSection {
+                SettingsRow("Display") {
+                    Picker("", selection: $settings.prefs.displayMode) {
+                        ForEach(DisplayMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 200)
+                }
+                SettingsRow("Show in Dock") { SettingsSwitch(isOn: $settings.prefs.showInDock) }
+                SettingsRow("Toggle panel") {
+                    Text("⌥⌘A").foregroundStyle(.secondary)
                 }
             }
-            Toggle("Show last prompt", isOn: $settings.prefs.showLastPrompt)
-            Toggle("Show model", isOn: $settings.prefs.showModel)
-            TextField("Name", text: $settings.prefs.hudName)
-            Section("Background") {
-                ColorPicker("Colour", selection: backgroundColor, supportsOpacity: false)
-                LabeledContent("Opacity") {
-                    Slider(value: $settings.prefs.backgroundOpacity, in: 0.05...1)
+            SettingsSection(footer: "Sessions idle longer than this are marked dead and can be cleared from the list.") {
+                SettingsRow("Row order") {
+                    Picker("", selection: $settings.prefs.order) {
+                        ForEach(RowOrder.allCases) { order in
+                            Text(order.label).tag(order)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 200)
+                }
+                SettingsRow("Dead after \(deadAfterLabel)") {
+                    Slider(value: $settings.prefs.deadAfterHours, in: 0.5...6, step: 0.5)
+                        .frame(width: 160)
                 }
             }
-            Section("Text") {
-                ColorPicker("Colour", selection: textColor, supportsOpacity: false)
-                LabeledContent("Opacity") {
-                    Slider(value: $settings.prefs.textOpacity, in: 0.2...1)
-                }
+            Button("Reset all settings") {
+                NSColorPanel.shared.close()
+                settings.prefs = Prefs()
+                resetToken += 1  // rebuild the view so colour swatches refresh
             }
-            Section("Context") {
-                Toggle("Show context %", isOn: $settings.prefs.showContext)
-                LabeledContent("Warn above \(Int(settings.prefs.contextWarnPct * 100))%") {
+            .controlSize(.small)
+        }
+    }
+
+    private var detailsTab: some View {
+        VStack(spacing: 16) {
+            SettingsSection(header: "Show per session") {
+                SettingsRow("Last prompt") { SettingsSwitch(isOn: $settings.prefs.showLastPrompt) }
+                SettingsRow("Model") { SettingsSwitch(isOn: $settings.prefs.showModel) }
+                SettingsRow("Context %") { SettingsSwitch(isOn: $settings.prefs.showContext) }
+                SettingsRow("Warn above \(Int(settings.prefs.contextWarnPct * 100))%") {
                     Slider(value: $settings.prefs.contextWarnPct, in: 0.3...0.9, step: 0.05)
+                        .frame(width: 160)
                 }
                 .disabled(!settings.prefs.showContext)
             }
-            Section("Notifications") {
-                Toggle("Notify on high context", isOn: $settings.prefs.notifyHighContext)
-                Toggle("Notify when waiting for input", isOn: $settings.prefs.notifyWaiting)
+            SettingsSection(
+                header: "Account",
+                footer: "Reads your Claude Code sign-in token from the Keychain to ask Anthropic for your limits. The token is sent only to api.anthropic.com."
+            ) {
+                SettingsRow("Usage left") { SettingsSwitch(isOn: $settings.prefs.showUsage) }
             }
-            Section("Usage limits") {
-                Toggle("Show usage left", isOn: $settings.prefs.showUsage)
-                Text("Reads your Claude Code sign-in token from the Keychain to ask Anthropic for your limits. The token is sent only to api.anthropic.com.")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
-            Section("Dead timer") {
-                LabeledContent("Dead after \(deadAfterLabel)") {
-                    Slider(value: $settings.prefs.deadAfterHours, in: 0.5...6, step: 0.5)
+        }
+    }
+
+    private var appearanceTab: some View {
+        VStack(spacing: 16) {
+            SettingsSection(header: "Background") {
+                SettingsRow("Colour") {
+                    ColorPicker("", selection: backgroundColor, supportsOpacity: false).labelsHidden()
+                }
+                SettingsRow("Opacity") {
+                    Slider(value: $settings.prefs.backgroundOpacity, in: 0.05...1).frame(width: 160)
                 }
             }
-            Section {
-                Button(role: .destructive) {
-                    NSColorPanel.shared.close()
-                    settings.prefs = Prefs()
-                    resetToken += 1  // rebuild the form so colour swatches refresh
-                } label: {
-                    Text("Reset settings")
-                        .frame(maxWidth: .infinity)
+            SettingsSection(header: "Text") {
+                SettingsRow("Colour") {
+                    ColorPicker("", selection: textColor, supportsOpacity: false).labelsHidden()
+                }
+                SettingsRow("Opacity") {
+                    Slider(value: $settings.prefs.textOpacity, in: 0.2...1).frame(width: 160)
                 }
             }
         }
-        .id(resetToken)
-        .formStyle(.grouped)
-        .frame(width: 360, height: 560)
     }
+
+    private var notificationsTab: some View {
+        SettingsSection(
+            header: "Notify when a session is",
+            footer: "High context uses the warn threshold from Details and needs Context % on. Each notification fires once per episode."
+        ) {
+            SettingsRow("Waiting for input") { SettingsSwitch(isOn: $settings.prefs.notifyWaiting) }
+            SettingsRow("Finished working") { SettingsSwitch(isOn: $settings.prefs.notifyFinished) }
+            SettingsRow("High context") { SettingsSwitch(isOn: $settings.prefs.notifyHighContext) }
+        }
+    }
+
+    // MARK: Helpers
 
     private var deadAfterLabel: String {
         let hours = settings.prefs.deadAfterHours
@@ -1029,6 +1123,128 @@ struct SettingsView: View {
     }
 }
 
+/// A card of rows with hairline separators, plus optional header and footer text.
+struct SettingsSection<Content: View>: View {
+    var header: String?
+    var footer: String?
+    @ViewBuilder let content: Content
+
+    init(header: String? = nil, footer: String? = nil, @ViewBuilder content: () -> Content) {
+        self.header = header
+        self.footer = footer
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let header {
+                Text(header)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 4)
+            }
+            _VariadicView.Tree(SeparatedRows()) { content }
+                .background(
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(Color.primary.opacity(0.04))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 9)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+            if let footer {
+                Text(footer)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 4)
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private struct SeparatedRows: _VariadicView_MultiViewRoot {
+        @ViewBuilder
+        func body(children: _VariadicView.Children) -> some View {
+            VStack(spacing: 0) {
+                ForEach(children) { child in
+                    child
+                    if child.id != children.last?.id {
+                        Divider().padding(.leading, 12)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One label-left, control-right settings row.
+struct SettingsRow<Control: View>: View {
+    let label: String
+    @ViewBuilder let control: Control
+
+    init(_ label: String, @ViewBuilder control: () -> Control) {
+        self.label = label
+        self.control = control()
+    }
+
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 12))
+            Spacer()
+            control
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+    }
+}
+
+struct SettingsSwitch: View {
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Toggle("", isOn: $isOn)
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .tint(.blue)
+            .controlSize(.small)
+    }
+}
+
+// MARK: - Global hotkey
+
+/// A system-wide hotkey via Carbon; works without accessibility permission.
+final class HotKey {
+    private var hotKeyRef: EventHotKeyRef?
+    private var handlerRef: EventHandlerRef?
+    private let action: () -> Void
+
+    init(keyCode: Int, modifiers: Int, action: @escaping () -> Void) {
+        self.action = action
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed)
+        )
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+            guard let userData else { return noErr }
+            Unmanaged<HotKey>.fromOpaque(userData).takeUnretainedValue().action()
+            return noErr
+        }, 1, &eventType, context, &handlerRef)
+        let hotKeyId = EventHotKeyID(signature: 0x4148_5544, id: 1)  // "AHUD"
+        RegisterEventHotKey(
+            UInt32(keyCode), UInt32(modifiers), hotKeyId,
+            GetApplicationEventTarget(), 0, &hotKeyRef
+        )
+    }
+
+    deinit {
+        if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
+        if let handlerRef { RemoveEventHandler(handlerRef) }
+    }
+}
+
 // MARK: - App delegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1039,8 +1255,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private let model = AgentModel()
     private let settings = Settings()
-    private var modelObservation: AnyCancellable?
     private var settingsObservation: AnyCancellable?
+    private var hotKey: HotKey?
     private let contextMenu = NSMenu()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1052,11 +1268,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         makePanel()
         makeStatusItem()
         applyDisplay(settings.prefs)
+        hotKey = HotKey(keyCode: kVK_ANSI_A, modifiers: cmdKey | optionKey) { [weak self] in
+            self?.togglePanel()
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
         showPanel()
         return false
+    }
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        let items: [(String, Selector)] = [
+            ("Show panel", #selector(showPanel)),
+            ("Hide panel", #selector(hidePanel)),
+            ("Settings…", #selector(openSettings)),
+        ]
+        for (title, action) in items {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            menu.addItem(item)
+        }
+        return menu
     }
 
     // MARK: Prefs application
@@ -1068,6 +1302,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.warnFraction = prefs.contextWarnPct
         model.notifyContext = prefs.notifyHighContext
         model.notifyWaiting = prefs.notifyWaiting
+        model.notifyFinished = prefs.notifyFinished
         let usageTurnedOn = !model.showUsage && prefs.showUsage
         model.showUsage = prefs.showUsage
         if usageTurnedOn { model.refreshUsage() }
@@ -1138,10 +1373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func makeStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(
-                systemSymbolName: "sparkles",
-                accessibilityDescription: "Agent HUD"
-            )
+            button.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Claude Agent HUD")
             button.action = #selector(statusItemClicked)
             button.target = self
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -1149,14 +1381,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         addMenuItem("Show panel", action: #selector(showPanel))
         addMenuItem("Settings…", action: #selector(openSettings), key: ",")
         contextMenu.addItem(.separator())
-        addMenuItem("Quit Agent HUD", action: #selector(quit), key: "q")
-
-        modelObservation = model.$sessions.receive(on: DispatchQueue.main).sink { [weak self] sessions in
-            let waiting = sessions.filter { $0.state == .waiting }.count
-            let busy = sessions.filter { $0.state == .busy }.count
-            let title = waiting > 0 ? " \(waiting)!" : (busy > 0 ? " \(busy)" : "")
-            self?.statusItem.button?.title = title
-        }
+        addMenuItem("Quit Claude Agent HUD", action: #selector(quit), key: "q")
     }
 
     private func addMenuItem(_ title: String, action: Selector, key: String = "") {
@@ -1194,6 +1419,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.menu = nil
             return
         }
+        togglePanel()
+    }
+
+    private func togglePanel() {
         if settings.prefs.displayMode == .dropdown {
             showDropdown()
         } else if panel.isVisible {
@@ -1211,12 +1440,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func hidePanel() {
+        popover?.performClose(nil)
+        panel.orderOut(nil)
+    }
+
     @objc private func openSettings() {
         if settingsWindow == nil {
             let window = NSWindow(
                 contentViewController: NSHostingController(rootView: SettingsView(settings: settings))
             )
-            window.title = "Agent HUD Settings"
+            window.title = "Claude Agent HUD Settings"
             window.styleMask = [.titled, .closable]
             window.isReleasedWhenClosed = false
             window.center()

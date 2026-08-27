@@ -1,4 +1,4 @@
-# Agent HUD
+# Claude Agent HUD
 
 A small macOS overlay that shows the state of local Claude Code sessions: what
 each agent is doing, how long it has been working, whether it is waiting for
@@ -43,7 +43,7 @@ All local, except the last one, which is opt-in:
 ./build.sh
 ```
 
-Compiles `agent-hud.swift` into `Agent HUD.app`, ad-hoc signs it, and
+Compiles `agent-hud.swift` into `Claude Agent HUD.app`, ad-hoc signs it, and
 relaunches it. Requires Xcode (Swift 5.9+) and macOS 14+.
 
 ## Files

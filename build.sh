@@ -1,9 +1,9 @@
 #!/bin/bash
-# Builds Agent HUD.app from agent-hud.swift and relaunches it.
+# Builds Claude Agent HUD.app from agent-hud.swift and relaunches it.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="Agent HUD.app"
+APP="Claude Agent HUD.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -swift-version 5 -O -o "$APP/Contents/MacOS/agent-hud" agent-hud.swift
 cp Info.plist "$APP/Contents/Info.plist"
